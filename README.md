@@ -3,11 +3,12 @@
 > **守夜人。** 中世纪城市的守夜人整夜巡逻：记录一切见闻，火情第一时间敲钟，危险拦在城门之外。
 > 本工具之于 AI agent，正是这个角色——记录每一次内部调用，鉴真每一次凭据，拦下每一条危险命令。
 
-**简写 `vig`**（安装器自动配置），与 `git` 同级手感。
+**简写 `vig`**（安装器自动配置），与 `git` 同级手感。**rtk 式代理用法**：不命中子命令时直接执行——
 
 ```
-vig run -- mycli trace abc123     → 过闸：审计 + 执行前审核
-vig tail                           → 实时看到每一次调用
+vig shandian status               → 代理：审计 + 执行前审核（推荐日常形态）
+vig kubectl get pods              → 同上，无需 run --
+vig tail                          → 实时看到每一次调用
 vig verify                        → 审计链完整性（防篡改）
 ```
 
@@ -36,24 +37,28 @@ AI agent 排查线上问题时会调用大量工具：查日志、查数据库�
 
 ## 安装
 
-Python 3.7+，**无第三方依赖**。
+Node.js 22.5+（内置 `node:sqlite`），**无 npm 依赖**。
 
-**平台支持**：Linux ✅（Ubuntu 22.04 / Python 3.12 实测）、Windows ✅（含 CMD/Git Bash 双入口）、
-macOS ✅（POSIX 同 Linux；默认用 `python3`）。CLI 入口由 `install.py` 安装时自动生成，
-且 `vigile.py` 会复制到安装目录——仓库移动/删除后 `vig` 命令依然可用。
+**平台支持**：Linux ✅、Windows ✅（含 CMD/Git Bash 双入口）、macOS ✅。
+CLI 入口由 `install.mjs` 安装时自动生成。
 
 ```bash
 git clone <this-repo> vigile
 cd vigile
-python install.py            # 装好 vigile 与 vig 双入口
+node install.mjs             # 装好 vigile 与 vig 双入口
 ```
 
 ## 快速开始
 
 ```bash
-# 过闸
-vig run -- kubectl get pods
-vig run --case BUG-123 --ticket BUG-123 -- bigdata-query sql "select ... limit 10"
+# 代理（推荐——rtk 式，命令名直接跟在 vig 后面）
+vig kubectl get pods
+vig bigdata-query sql "select ... limit 10"
+vig --case BUG-123 --ticket BUG-123 kubectl get pods   # 带工单上下文
+
+# 显式过闸（命令名撞子命令时用 -- 逃逸）
+vig run -- logs get x
+vig -- kubectl version
 
 # 看
 vig tail                     # 实时
@@ -100,11 +105,15 @@ vig setup --uninstall --agent codex   # 卸载
 
 | agent | 能力 |
 |---|---|
-| Claude Code | **强制改写**命令为 `vig run --` + deny（无法绕过） |
+| Claude Code | **强制改写**命令为 `vig <命令>` + deny/ask（无法绕过） |
+| ZCode | **强制改写**（PreToolUse `updatedInput`）+ deny/ask |
 | Codex | **强制改写** + deny |
-| dsh | 经 dsh-hooks-claude-code 桥**复用 Claude 配置** |
-| ZCode | deny 拦截 + 提醒 |
+| dsh | 经 dsh-hooks-claude-code 桥**复用 Claude 配置**（桥不支持改写时旁路记录） |
 | OpenCode | 规则约束（无原生 hook） |
+
+hook 的改写串带环境消毒（`env -u VIGILE_CONFIRM …`）：shell 环境残留的确认变量
+不会穿透到 hook 改写的命令——hook 已把命令转成显式 allow，这个通道必须封死。
+fail-open 时 stderr 出警告，绝不静默放行。
 
 ## 自定义策略与提示语
 
@@ -152,7 +161,8 @@ vig session 84400@123/multica:T-9876
 ## 环境变量
 
 `VIGILE_DB` / `VIGILE_ACTOR` / `VIGILE_SESSION` / `VIGILE_CASE` / `VIGILE_TICKET`
-/ `VIGILE_POLICY` / `VIGILE_RULES` / `VIGILE_CONFIRM`（默认 `~/.vigile/vigile.db`）。
+/ `VIGILE_POLICY` / `VIGILE_RULES` / `VIGILE_CONFIRM`（数据库默认 `~/.vigile/vigile.db`）。
+注意 `VIGILE_CONFIRM` 只对**手工**调用有效——hook 改写的命令会先剥掉它，防止环境残留值静默通过 ask 档。
 旧 `GATE_*` / `AUDIT_*` 仍兼容。
 
 ## 为什么用 SQLite
@@ -163,10 +173,10 @@ vig session 84400@123/multica:T-9876
 ## 测试
 
 ```bash
-cd scripts && python -m unittest _test_vigile _test_vigile_setup
+npm test        # 或 node --test test/vigile.test.js
 ```
 
-100 个测试。
+48 个测试（脱敏 / 策略三档 / hook 判定 / vig 代理形态 / hash 链跨版本兼容 / CLI 集成）。
 
 ## License
 

@@ -11,6 +11,7 @@
 //   VIGILE_HOOK_MODE=claude        # Claude 系（支持 updatedInput 改写）；默认 zcode（仅提醒+deny）
 
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -32,20 +33,34 @@ const MODE = process.env.VIGILE_HOOK_MODE
 
 // 改写后的命令必须以一个可解析的命令开头，否则被拦截的命令会变成
 // "command not found" —— 那等于是 hook 把用户的正常命令弄坏了。
-// 优先用 `vigile`（命令列表可读）；PATH 上没有就退回 node + 绝对脚本路径，
-// 两者都拿不到时返回空串，由调用方降级为旁路记录。
-let VIGILE_PREFIX = null;
+// 优先用 `vig`（短，rtk 式手感）；PATH 上没有就退回 node + 绝对脚本路径，
+// 两者都拿不到时返回空串，由调用方降级为旁路记录（并警告）。
+// 探测结果落磁盘缓存（OS 临时目录）：hook 是每次调用新起的进程，
+// 进程内缓存无效，每次 spawn `where` 又白付 ~50ms（rtk 同款思路）。
+const PREFIX_CACHE = path.join(os.tmpdir(), "vigile-prefix.cache");
 function vigilePrefix() {
-  if (VIGILE_PREFIX !== null) return VIGILE_PREFIX;
+  try {
+    const hit = fs.readFileSync(PREFIX_CACHE, "utf8").trim();
+    if (hit === "none") return "";
+    if (hit && (hit === "vigile" || hit === "vig")) return hit;
+  } catch { /* 无缓存则探测 */ }
+  let found = "";
   const probe = process.platform === "win32" ? "where" : "which";
-  for (const name of ["vigile", "vig"]) {
+  for (const name of ["vig", "vigile"]) {
     const r = spawnSync(probe, [name], { encoding: "utf8", timeout: 2000, windowsHide: true });
-    if (r.status === 0 && (r.stdout || "").trim()) { VIGILE_PREFIX = name; return VIGILE_PREFIX; }
+    if (r.status === 0 && (r.stdout || "").trim()) { found = name; break; }
   }
-  VIGILE_PREFIX = fs.existsSync(VIGILE_SCRIPT)
-    ? `"${process.execPath}" "${VIGILE_SCRIPT}"`
-    : "";
-  return VIGILE_PREFIX;
+  if (!found && fs.existsSync(VIGILE_SCRIPT)) {
+    // PATH 上没有 shim 时退回绝对路径调用 —— 前缀要带引号（路径可能含空格）。
+    found = "";
+    writePrefixCache("abs");
+    return `"${process.execPath}" "${VIGILE_SCRIPT}"`;
+  }
+  writePrefixCache(found || "none");
+  return found;
+}
+function writePrefixCache(v) {
+  try { fs.writeFileSync(PREFIX_CACHE, v); } catch { /* 缓存写不进就每次探测 */ }
 }
 
 // ---------------------------------------------------------------- 需审计的工具
@@ -102,14 +117,16 @@ function deny(reason) {
   process.exit(0);
 }
 
-function ask(reason) {
-  process.stdout.write(JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName: "PreToolUse",
-      permissionDecision: "ask",
-      permissionDecisionReason: reason,
-    },
-  }));
+function ask(reason, updatedInput) {
+  const out = {
+    hookEventName: "PreToolUse",
+    permissionDecision: "ask",
+    permissionDecisionReason: reason,
+  };
+  // 带上改写后，用户批准时执行的仍是 vigile run —— 否则命令按原样执行，
+  // 审计库里只剩"曾经问过"，没有任何执行结果。
+  if (updatedInput) out.updatedInput = updatedInput;
+  process.stdout.write(JSON.stringify({ hookSpecificOutput: out }));
   process.exit(0);
 }
 
@@ -195,31 +212,40 @@ function decide(raw) {
     recordIntent(cmd, "denied", `[策略拒绝/${verdict.ruleId}] ${verdict.message}`, hostMode);
     deny(`[vigile 策略拒绝] ${verdict.message}${verdict.hint ? " 建议：" + verdict.hint : ""}`);
   }
+
+  const prefix = vigilePrefix();
+  const canRewrite = (hostMode === "claude" || hostMode === "zcode") && Boolean(prefix);
+  const isComplex = COMPLEX.test(cmd);
+  // 代理形态：vig kubectl version（rtk 式），比 "vigile run --quiet --" 短且自然。
+  // 消毒（rtk 同款）：VIGILE_CONFIRM 会自动通过 ask 档确认，shell 环境里残留的
+  // 值（rc 文件、.envrc、CI 注入）不得穿透到 hook 改写的命令 —— hook 本身会把
+  // 命令转成显式 allow，等于这个通道放松了审批门，必须在改写时剥掉。
+  const scrub = "env -u VIGILE_CONFIRM -u GATE_CONFIRM -u AUDIT_CONFIRM";
+  const rewritten = `${scrub} ${prefix} ${cmd}`;
+
   // ask 档交给宿主弹确认：hook 自己无法交互，只能把判定转成宿主的"询问"。
-  // dsh 桥不支持 ask，降级为放行 —— 但审计库仍留下这次调用的意图。
+  // 若同时能用改写，批准后弹出的命令仍是 vigile run —— 否则审计库里只剩
+  // "曾经问过"，拿不到任何执行结果，等于批准后的调用完全没被审计。
   if (verdict.decision === "ask") {
     if (hostMode === "dsh") {
       recordIntent(cmd, "ok", `[需确认/${verdict.ruleId}] ${verdict.message}`, hostMode);
     } else {
-      ask(`[vigile 需确认] ${verdict.message}${verdict.hint ? " 建议：" + verdict.hint : ""}`);
+      ask(`[vigile 需确认] ${verdict.message}${verdict.hint ? " 建议：" + verdict.hint : ""}`,
+        canRewrite && !isComplex ? { ...input, command: rewritten } : null);
     }
   }
 
   // 复合命令无法安全改写或精确判定，但其首段仍要过 deny 检查（已在上面完成）。
-  if (COMPLEX.test(cmd)) return process.exit(0);
+  if (isComplex) return process.exit(0);
   if (!needsGate(cmd)) return process.exit(0);
 
-  const prefix = vigilePrefix();
-  const rewritten = `${prefix || "vigile"} run --quiet -- ${cmd}`;
-
   // 两种宿主能力，逐级降级：
-  //   claude / zcode —— 支持 PreToolUse 的 updatedInput，改写为 vigile run 后
+  //   claude / zcode —— 支持 PreToolUse 的 updatedInput，改写为 vig 代理后
   //                     由主程序完整审计（含真实 exit_code / 耗时 / 输出摘要）。
   //   dsh            —— 桥不支持 updatedInput（官方 README 明确：logged + warned
   //                     but not honored），也忽略 additionalContext；只能由 hook
   //                     自己旁路记录"意图"，且拿不到执行结果。
-  // 拿不到可执行的 vigile 前缀时不改写，否则命令会变成 command not found。
-  if ((hostMode === "claude" || hostMode === "zcode") && prefix) {
+  if (canRewrite) {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -229,9 +255,9 @@ function decide(raw) {
       },
     }));
   } else {
-    // 旁路记录：命令照原样执行，但审计库留下这次调用的意图。
-    // 拿不到结果，故 status 记 "ok"、duration 记 0，并标注 source=hook-bypass
-    // 以示与完整审计的区别（真实结果请看宿主自己的日志）。
+    // fail-open，但不静默：拿不到可执行前缀时命令照原样执行（审计降级为
+    // 意图记录）。静默放行会让用户以为"还在被审计"，stderr 警告一次。
+    process.stderr.write("[vigile] 警告：vigile 不在 PATH 上且脚本不可达，本次命令不经完整审计（仅记意图）。\n");
     recordIntent(cmd, "ok", null, hostMode);
   }
   process.exit(0);
