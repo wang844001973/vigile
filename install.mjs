@@ -30,7 +30,40 @@ function entries(dir) {
 function inPath(dir) {
   const parts = (process.env.PATH || "").split(path.delimiter);
   const norm = (p) => path.normalize(p.toLowerCase().replace(/[/\\]+$/, ""));
-  return parts.filter(Boolean).some(p => norm(p) === norm(dir));
+  if (parts.filter(Boolean).some(p => norm(p) === norm(dir))) return true;
+  // 当前 shell 进程可能是装 PATH 之前启动的（改完注册表老终端看不到），
+  // 再查一次注册表里的持久 User PATH。
+  if (os.platform() === "win32") {
+    try {
+      const r = execFileSync("powershell", ["-NoProfile", "-Command",
+        "[Environment]::GetEnvironmentVariable('PATH','User')"], { encoding: "utf8" });
+      return r.split(";").filter(Boolean).some(p => norm(p) === norm(dir));
+    } catch { return false; }
+  }
+  return false;
+}
+
+// Windows：确保本目录在用户 PATH 里排在所有含 vig/vigile 的其他目录之前
+// （尤其 ~/.local/bin —— Git Bash 版 sh 脚本在那里）。改的是注册表级
+// User PATH，不碰 Machine（无需管理员）。
+import { execFileSync } from "node:child_process";
+function ensureUserPathFirst(dir) {
+  const target = dir.replace(/'/g, "''");
+  const script = [
+    "$ErrorActionPreference='Stop'",
+    `$dir = '${target}'`,
+    "$cur = [Environment]::GetEnvironmentVariable('PATH','User') -split ';' | Where-Object { $_ -and $_ -ne $dir }",
+    "$first = @($dir) + $cur",
+    "[Environment]::SetEnvironmentVariable('PATH', ($first -join ';'), 'User')",
+    "Write-Output 'ok'",
+  ].join("\n");
+  try {
+    const r = execFileSync("powershell", ["-NoProfile", "-Command", script], { encoding: "utf8" });
+    if (r.includes("ok")) console.log("已将本目录挪到用户 PATH 首位（防 Git Bash sh 脚本遮蔽 .cmd）");
+  } catch (e) {
+    console.log("⚠ 自动调整 PATH 顺序失败（不影响本次使用，可手动把目录挪前）：");
+    console.log("  " + String(e.message).split("\n")[0]);
+  }
 }
 
 const argv = process.argv.slice(2);
@@ -65,19 +98,20 @@ for (const t of entries(dir)) {
   }
 }
 
-// Windows 下清理 Git Bash 时代遗留的无扩展名 shim。
-// 那类文件是 sh 脚本，PowerShell 会把它当"文档"执行并报
-// 「无法在管道中间运行文档」；而它若在 PATH 中排在 .cmd 之前，
-// 还会遮蔽掉正确的入口 —— CMD 里敲 vig 也一起坏掉。
+// Windows 双入口策略：CMD/PowerShell 用 Programs\vigile\*.cmd（上面已生成），
+// Git Bash 需要无扩展名 sh 脚本 —— 放 ~/.local/bin 并由本安装器接管生成。
+// 之前采用删除 sh shim 的做法修 PowerShell 报错，结果删掉过 Git Bash 的
+// 唯一入口，属于误伤；正确姿势是接管生成 + 把 .cmd 目录挪到 PATH 首位。
 if (os.platform() === "win32") {
-  for (const legacy of ["vig", "vigile"]) {
-    const p = path.join(dir, legacy);
-    if (!fs.existsSync(p)) continue;
-    let head = "";
-    try { head = fs.readFileSync(p, "utf8").slice(0, 40); } catch { continue; }
-    if (!head.startsWith("#!")) continue;   // 不是 sh 脚本就别动
-    console.log(`${dry ? "[dry-run] 将删除" : "清理遗留 shim"} ${p}`);
-    if (!dry) { try { fs.rmSync(p); } catch { /* 权限不足就算了，下面会警告 */ } }
+  const bashDir = path.join(os.homedir(), ".local", "bin");
+  for (const name of ["vigile", "vig"]) {
+    const p = path.join(bashDir, name);
+    console.log(`${dry ? "[dry-run] 将写入" : "写入"} ${p}  （Git Bash 入口）`);
+    if (!dry) {
+      fs.mkdirSync(bashDir, { recursive: true });
+      fs.writeFileSync(p, `#!/bin/sh\nexec "${process.execPath}" "${TARGET}" "$@"\n`);
+      fs.chmodSync(p, 0o755);
+    }
   }
 }
 
@@ -85,10 +119,15 @@ if (!dry) console.log("安装完成。");
 if (!inPath(dir)) {
   console.log("\n⚠ 该目录不在 PATH 中，请加入：");
   if (os.platform() === "win32") {
-    console.log(`   setx PATH "%PATH%;${dir}"`);
+    console.log(`   setx PATH "${dir};%PATH%"    （注意放最前，理由见下）`);
   } else {
     console.log(`   export PATH="${dir}:$PATH"  （建议写进 ~/.bashrc）`);
   }
+} else if (os.platform() === "win32") {
+  // Windows 顺序很关键：~/.local/bin 里若有 Git Bash 版无扩展名 sh 脚本
+  // （给 Git Bash 用的入口就放那里），它排在前面时 PowerShell 会把它
+  // 当"文档"执行报错。把自己挪到用户 PATH 首位，.cmd 在所有 shell 优先。
+  if (!dry) ensureUserPathFirst(dir);
 } else {
   console.log("PATH 已包含该目录，可直接运行: vig --help");
 }
@@ -107,10 +146,9 @@ if (os.platform() === "win32") {
     }
   }
   if (conflicts.length) {
-    console.log("\n⚠ 发现其他 vig/vigile 入口，可能遮蔽本安装（按 PATH 顺序先生效）：");
-    for (const c of conflicts) console.log(`   ${c}`);
-    console.log("   建议删除上面这些旧入口（多为早期 Git Bash 版 sh 脚本），");
-    console.log("   PowerShell 遇到无扩展名的 sh 脚本会报「无法在管道中间运行文档」。");
+    console.log("\nℹ PATH 中还有其他 vig/vigile 入口（如 Git Bash 用的 ~/.local/bin sh 脚本）。");
+    console.log("   本安装器已把自己挪到用户 PATH 首位，.cmd 在 CMD/PowerShell 优先命中；");
+    console.log("   sh 入口留给 Git Bash。若发现仍有遮蔽，检查目录顺序。");
   }
 }
 
