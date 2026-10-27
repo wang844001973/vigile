@@ -403,6 +403,24 @@ function cmdSetup(args) {
   return import("../src/setup.js").then(m => m.setupMain(args));
 }
 
+function cmdInit(args) {
+  // vig init / vig init --global —— rtk 式入口。
+  // 全局装 hook + 引导完成（与 setup --install --agent all 等价）。
+  const global = args.yes || true;   // init 语义即全局，--global 仅显式声明
+  return import("../src/setup.js").then(m => m.setupMain({
+    ...args, install: true, agent: args.agent || "all",
+  })).then(() => {
+    out("");
+    out("初始化完成。验证:");
+    out("  vig kubectl version --client   跑一条内部命令");
+    out("  vig logs --limit 5             看审计记录");
+    out("  vig setup --status             看各 agent hook 状态");
+    out("");
+    err("提示: hook 配置在 agent 启动时加载 —— 已在运行的 agent 需重启后生效。");
+    return EXIT_OK;
+  });
+}
+
 // ---------------------------------------------------------------- 参数解析（极简，无依赖）
 function parseArgs(argv) {
   const [cmd, ...rest] = argv;
@@ -458,10 +476,11 @@ const HELP = `vigile — 守夜人：AI agent 内部调用的统一入口（审�
 审计:  run / call / call-file-change / logs / tail / get / export
 分析:  stats / slow / errors / by-case / timeline / session / diff
 安全:  policy / verify
-配置:  rules / setup / prune
+配置:  rules / setup / init / prune
 
 常用:
   vig shandian status               代理：执行 + 审计 + 审核（推荐日常形态）
+  vig init --global                 一键给所有 agent 装 hook
   vigile run --case X --ticket Y -- <命令>   带工单上下文执行
   vigile tail                       实时跟踪
   vigile logs --since 2h            查询
@@ -474,7 +493,7 @@ const HELP = `vigile — 守夜人：AI agent 内部调用的统一入口（审�
 const RESERVED = new Set([
   "run", "call", "call-file-change", "logs", "tail", "get", "stats", "slow",
   "errors", "by-case", "timeline", "session", "diff", "export", "verify",
-  "policy", "rules", "setup", "prune",
+  "policy", "rules", "setup", "init", "prune",
   "-h", "--help", "help", "--version", "-V", "--", "-y", "--yes", "--quiet", "--json",
 ]);
 
@@ -520,6 +539,7 @@ async function main() {
       case "prune": return cmdPrune(args);
       case "tail": return cmdTail(args);
       case "setup": return await cmdSetup(args);
+      case "init": return await cmdInit(args);
       default:
         err(`未知命令: ${cmd}\n`);
         out(HELP);

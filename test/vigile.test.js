@@ -347,3 +347,24 @@ test("CLI 代理: 子命令仍走原分支", () => {
   assert.equal(r.code, 0);
   assert.match(r.out, /allow/);
 });
+
+// ================================================================ vig init
+// vig init 是 rtk 式入口：等价 setup --install --agent all，装完给出验证指引。
+test("CLI init: 一键装 hook 并输出验证指引", () => {
+  const r = cli(["init"]);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /初始化完成|已注册/);
+  assert.match(r.out, /vig logs/);
+});
+test("CLI init: init 在保留子命令列表中（不被代理形态吞掉）", () => {
+  const r = cli(["init"]);
+  assert.doesNotMatch(r.out, /未知命令/);
+});
+// install.sh 是一键安装的载体：关键环节缺一不可。
+test("install.sh: 覆盖 node 版本检查/tar 安全/真实下载地址", () => {
+  const sh = fs.readFileSync(path.join(ROOT, "..", "install.sh"), "utf8");
+  assert.match(sh, /node.*22/);                              // node >= 22.5 检查
+  assert.match(sh, /archive\/\$\{REF\}\.tar\.gz/);           // GitHub tarball
+  assert.match(sh, /tar -tzf.*grep -qE/);                    // tar 路径穿越检查存在
+  assert.match(sh, /releases\/latest/);                      // 版本发现
+});
