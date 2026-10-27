@@ -377,3 +377,20 @@ test("install.mjs: Windows 清理遗留 sh shim 并报告 PATH 冲突", () => {
   assert.match(m, /startsWith\("#!"\)/);                     // 只删 sh 脚本
   assert.match(m, /发现其他 vig\/vigile 入口/);               // 冲突报告
 });
+
+// ================================================================ Web 控制台
+// 页面 HTML 内嵌在模板字符串里：任何 \x 转义都会改变页面侧脚本语义。
+// 曾经 /\+08:00$/ 被 \+ 吃掉变成 /+08:00$/，页面整个 script 语法错误、
+// 停在"加载中…"。这里用与浏览器相同的方式（new Function）做语法级把关。
+test("web: 页面脚本能通过 JS 语法检查（无模板转义事故）", () => {
+  const web = fs.readFileSync(path.join(ROOT, "..", "src", "web.js"), "utf8");
+  const html = web.slice(web.indexOf("const PAGE_HTML"));
+  const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
+  assert.doesNotThrow(() => new Function(script));           // 浏览器同款语法检查
+});
+test("web: 服务含五个 API 端点且仅绑 127.0.0.1", () => {
+  const web = fs.readFileSync(path.join(ROOT, "..", "src", "web.js"), "utf8");
+  for (const ep of ["/api/rows", "/api/stats", "/api/get", "/api/files", "/api/verify"])
+    assert.ok(web.includes(`"${ep}"`), ep);
+  assert.match(web, /host = "127\.0\.0\.1"/);                 // 审计数据不出本机
+});
