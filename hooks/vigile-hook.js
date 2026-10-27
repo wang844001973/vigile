@@ -17,7 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { evaluate } from "../src/engine.js";
+import { evaluate, inferCategory, inferRisk } from "../src/engine.js";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const VIGILE_SCRIPT = process.env.VIGILE_SCRIPT
@@ -82,6 +82,28 @@ const AUDIT_TOOLS = new Set([
 ]);
 const AUDIT_SCRIPTS = /(?:^|[/\\])(ticket_intake|jira|jira_transition|dialog_query|order_center|prometheus|redash|glab|agentos_execution|kb_\w+|badcase_ticket)\.py$/i;
 const COMPLEX = /[|;&><`]|\$\(|\|\||&&/;
+
+// 全量审计模式（rules.json: audit_mode = "all" | "whitelist"，默认 all）：
+// 白名单外的命令也旁路记一条意图，做到"任何终端调用都有记录"。
+// 噪声名单（rules.json: noise 数组）是高频纯只读命令——记它们只会把库
+// 灌满，默认排除；置空数组 [] 即可全记。
+function loadRulesJson() {
+  try {
+    return JSON.parse(fs.readFileSync(
+      path.join(os.homedir(), ".vigile", "rules.json"), "utf8"));
+  } catch { return {}; }
+}
+function auditMode() {
+  return loadRulesJson().audit_mode === "whitelist" ? "whitelist" : "all";
+}
+function isNoise(cmd) {
+  const noise = loadRulesJson().noise;
+  if (!Array.isArray(noise)) return DEFAULT_NOISE.has(baseName(firstToken(cmd) || ""));
+  if (!noise.length) return false;                    // 置空 = 全记
+  return noise.map(s => String(s).toLowerCase()).includes(baseName(firstToken(cmd) || ""));
+}
+const DEFAULT_NOISE = new Set(["ls", "pwd", "cat", "head", "tail", "grep", "find",
+  "which", "where", "whoami", "date", "echo", "wc", "stat", "file", "du", "df"]);
 
 function firstToken(cmd) {
   const trimmed = cmd.trim();
@@ -244,7 +266,14 @@ function decide(raw) {
 
   // 复合命令无法安全改写或精确判定，但其首段仍要过 deny 检查（已在上面完成）。
   if (isComplex) return process.exit(0);
-  if (!needsGate(cmd)) return process.exit(0);
+
+  // 全量审计：白名单只决定"是否改写拿到完整结果"；记录面默认覆盖一切命令
+  // （rules.json 的 audit_mode=all）。噪声名单（ls/cat/pwd 等高频只读）可关。
+  // 白名单外不改写 → 旁路记一条意图，命令照原样执行，行为零影响。
+  if (!needsGate(cmd)) {
+    if (auditMode() === "all" && !isNoise(cmd)) recordIntent(cmd, "ok", null, hostMode);
+    return process.exit(0);
+  }
 
   // 两种宿主能力，逐级降级：
   //   claude / zcode —— 支持 PreToolUse 的 updatedInput，改写为 vig 代理后
@@ -292,10 +321,10 @@ function recordIntent(cmd, status, error, host) {
       "--source", "hook",
       "--tool", baseName(parts[0] || "unknown"),
       "--action", parts[1] || "",
-      "--category", "other",
+      "--category", inferCategory(parts[0] || "unknown", cmd),
       "--status", status,
       "--duration", "0",
-      "--risk", "unknown",
+      "--risk", inferRisk(parts[0] || "unknown", cmd),
       "--args", JSON.stringify({ argv: parts, mode: MODE }),
       "--meta", JSON.stringify({ source: "hook-bypass", host: host || MODE }),
       ...(error ? ["--error", error] : []),

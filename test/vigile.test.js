@@ -324,6 +324,19 @@ test("setup: claude hook 命令用 --mode 参数而非环境变量前缀", () =>
   assert.doesNotMatch(setup, /VIGILE_HOOK_MODE=/);
 });
 
+// ================================================================ 全量审计模式
+// audit_mode=all：白名单外的命令也旁路记一条意图（任何终端调用都有记录）。
+// 白名单只决定“是否改写拿到完整结果”，记录面覆盖一切。
+test("hook: 全量模式记录非白名单命令（git log）", () => {
+  const r = runHook('git log -3');
+  assert.equal(r.out.trim(), "");   // 不改写（返回空）
+});
+test("hook: 噪声名单命令被跳过（ls）", () => {
+  const r = runHook('ls -la');
+  assert.equal(r.out.trim(), "");
+});
+// 噪声与全量的区别在落库，不在 hook 输出——由 DB 集成测试与 rules.json 配置覆盖。
+
 // ================================================================ vig 代理形态
 // vig shandian status == vigile run --quiet -- shandian status（rtk 式用法）。
 // 危险模式拆开构造，避免本测试源码里的字面量被真实 hook 拦截。
