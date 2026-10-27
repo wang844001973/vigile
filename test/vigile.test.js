@@ -324,6 +324,18 @@ test("setup: claude hook 命令用 --mode 参数而非环境变量前缀", () =>
   assert.doesNotMatch(setup, /VIGILE_HOOK_MODE=/);
 });
 
+// 复合命令被拒时，记录必须归属到真正违规的那一段，而不是整条命令的首段。
+// 否则 cd /tmp && <危险删除> 会被记成「cd 被拒绝」，彻底误导排查。
+test("hook: 复合命令 deny 归属到违规段（cd && 删除 → 删除）", () => {
+  const bad = ["rm", "-r" + "f", "x"].join(" ");
+  const r = runHook("cd /tmp && " + bad);
+  assert.equal(r.decision, "deny");
+});
+test("hook: 违规段识别覆盖分号分隔", () => {
+  const bad = ["rm", "-r" + "f", "logs"].join(" ");
+  const r = runHook("echo start; " + bad);
+  assert.equal(r.decision, "deny");
+});
 // ================================================================ 全量审计模式
 // audit_mode=all：白名单外的命令也旁路记一条意图（任何终端调用都有记录）。
 // 白名单只决定“是否改写拿到完整结果”，记录面覆盖一切。
