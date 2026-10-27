@@ -39,14 +39,37 @@ AI agent 排查线上问题时会调用大量工具：查日志、查数据库�
 
 Node.js 22.5+（内置 `node:sqlite`），**无 npm 依赖**。
 
-**平台支持**：Linux ✅、Windows ✅（含 CMD/Git Bash 双入口）、macOS ✅。
-CLI 入口由 `install.mjs` 安装时自动生成。
+**一键安装**（Linux / macOS / WSL / Git Bash）：
 
 ```bash
-git clone <this-repo> vigile
-cd vigile
-node install.mjs             # 装好 vigile 与 vig 双入口
+curl -fsSL https://raw.githubusercontent.com/wang844001973/vigile/refs/heads/master/install.sh | sh
 ```
+
+装好 `vigile` / `vig` 双入口到 `~/.local/bin`（本体在 `~/.local/vigile`），
+然后一条命令给所有 agent 装 hook：
+
+```bash
+vig init --global
+```
+
+可定制：`VIGILE_DIR=~/tools VIGILE_BRANCH=develop sh install.sh`。
+
+**Windows（CMD / PowerShell）**——`curl | sh` 不适用，用 git 直接装：
+
+```powershell
+git clone https://github.com/wang844001973/vigile.git "$env:LOCALAPPDATA\Programs\vigile-src"
+node "$env:LOCALAPPDATA\Programs\vigile-src\install.mjs"
+# install.mjs 生成 vigile.cmd / vig.cmd 并提示 PATH 设置（setx 后重开终端）
+```
+
+**从源码**（开发者）：
+
+```bash
+git clone https://github.com/wang844001973/vigile.git
+cd vigile && node install.mjs
+```
+
+**平台支持**：Linux ✅、Windows ✅（含 CMD/Git Bash 双入口）、macOS ✅。
 
 ## 快速开始
 
@@ -55,6 +78,9 @@ node install.mjs             # 装好 vigile 与 vig 双入口
 vig kubectl get pods
 vig bigdata-query sql "select ... limit 10"
 vig --case BUG-123 --ticket BUG-123 kubectl get pods   # 带工单上下文
+
+# 初始化（装完第一件事）
+vig init --global             # 给所有 agent 装 hook
 
 # 显式过闸（命令名撞子命令时用 -- 逃逸）
 vig run -- logs get x
