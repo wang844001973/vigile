@@ -16,6 +16,7 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const BIN = path.join(ROOT, "..", "bin", "vigile.js");
 
 import { DatabaseSync } from "node:sqlite";
+import { createHash } from "node:crypto";
 const core = await import("../src/core.js");
 const engine = await import("../src/engine.js");
 
@@ -188,5 +189,35 @@ test("CLI: setup --list 列出五 agent", () => {
   assert.equal(r.code, 0);
   for (const a of ["zcode", "claude", "codex", "dsh", "opencode"]) {
     assert.match(r.out, new RegExp(a));
+  }
+});
+
+// ================================================================ 跨版本 hash 兼容
+test("hash 链: 兼容 Python 版历史算法（exit_code=0 归一差异）", () => {
+  // Python 用 `x or ""` 把 0 归一为空串；Node 保留 0。
+  // 历史记录按 Python 算法写入，校验必须两种都接受。
+  const db = path.join(os.tmpdir(), "vigile-legacy-hash.db");
+  fs.rmSync(db, { force: true });
+  const d = new DatabaseSync(db);
+  d.exec(`CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, ts_epoch INTEGER,
+    session TEXT, actor TEXT, source TEXT, category TEXT, tool TEXT, action TEXT, target TEXT,
+    args_json TEXT, status TEXT, exit_code INTEGER, duration_ms INTEGER, rows INTEGER,
+    result_size INTEGER, output_digest TEXT, error TEXT, case_name TEXT, ticket TEXT,
+    risk TEXT, meta_json TEXT, prev_hash TEXT, hash TEXT)`);
+  const orE = (v) => (v === null || v === undefined || v === 0 || v === "") ? "" : String(v);
+  const legHash = createHash("sha256")
+    .update(orE("2026-01-01T00:00:00.000") + "|" + orE("t") + "|" + orE(null) + "|" +
+      orE(null) + "|" + orE("ok") + "|" + orE(0) + "|" + orE(null)).digest("hex");
+  d.prepare(`INSERT INTO audit_log (ts, tool, status, exit_code, prev_hash, hash, source, category)
+    VALUES (?,?,?,?,?,?,?,?)`).run("2026-01-01T00:00:00.000", "t", "ok", 0, null, legHash, "cli", "other");
+  d.close();
+  const saved = process.env.VIGILE_DB;
+  process.env.VIGILE_DB = db;
+  try {
+    const r = spawnSync(process.execPath, [BIN, "verify"], { encoding: "utf8", env: { ...process.env } });
+    assert.equal(r.status, 0, `Python 算法历史记录应通过校验，实际: ${r.stdout}`);
+  } finally {
+    process.env.VIGILE_DB = saved;
+    fs.rmSync(db, { force: true, retryDelayMS: 100 });
   }
 });

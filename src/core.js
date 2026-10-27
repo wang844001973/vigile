@@ -200,7 +200,19 @@ function sha256(text) {
   return createHash("sha256").update(String(text), "utf8").digest("hex");
 }
 
-/** 验证 hash 链完整性。返回 {ok, total, broken: [{id, reason}]}。 */
+/** Python 版算法的等价实现（兼容迁移前的历史记录）。
+ *  Python 用 `str(row.get(k) or "")`：0、空串、None 全部归一为空串。
+ *  Node 新算法保留 0 的语义更正确，但历史记录按 Python 算法写入，
+ *  校验时两种都接受，否则迁移会被误判为"被篡改"。 */
+function chainHashLegacy(prev, row) {
+  const orEmpty = (v) => (v === null || v === undefined || v === 0 || v === "") ? "" : String(v);
+  const fields = [orEmpty(row.ts), orEmpty(row.tool), orEmpty(row.action),
+    orEmpty(row.target), orEmpty(row.status), orEmpty(row.exit_code),
+    orEmpty(row.duration_ms)];
+  return createHash("sha256").update((prev || "") + fields.join("|")).digest("hex");
+}
+
+/** 验证 hash 链完整性。返回 {ok, total, broken: [{id, reason}], legacy}。 */
 export function verifyChain() {
   const db = connect();
   const rows = db.prepare(
@@ -208,9 +220,10 @@ export function verifyChain() {
   let prevHash = null, broken = [], legacy = 0;
   for (const r of rows) {
     if (!r.hash) { legacy++; prevHash = null; continue; }
-    const expected = chainHash(r.prev_hash, r);
+    const ok = r.hash === chainHash(r.prev_hash, r)
+      || r.hash === chainHashLegacy(r.prev_hash, r);
     const chainOk = (r.prev_hash === prevHash) || (prevHash === null && r.prev_hash === null);
-    if (r.hash !== expected || !chainOk) {
+    if (!ok || !chainOk) {
       broken.push({ id: r.id, reason: "hash 不匹配（记录可能被篡改或前后被删）" });
     }
     prevHash = r.hash;
