@@ -221,3 +221,60 @@ test("hash 链: 兼容 Python 版历史算法（exit_code=0 归一差异）", ()
     fs.rmSync(db, { force: true, retryDelayMS: 100 });
   }
 });
+
+// ================================================================ hook 判定
+const HOOK = path.join(ROOT, "..", "hooks", "vigile-hook.js");
+
+function runHook(command, mode = "zcode", extraEnv = {}) {
+  const payload = JSON.stringify({
+    hook_event_name: "PreToolUse", tool_name: "Bash",
+    tool_input: { command }, transcript_path: "C:/tmp/x.jsonl",
+  });
+  const r = spawnSync(process.execPath, [HOOK], {
+    encoding: "utf8", input: payload,
+    env: { ...process.env, VIGILE_HOOK_MODE: mode, ...extraEnv },
+  });
+  let parsed = null;
+  try { parsed = JSON.parse(r.stdout); } catch { /* 空输出即"不干预" */ }
+  return { code: r.status, out: r.stdout, decision: parsed?.hookSpecificOutput?.permissionDecision ?? null,
+    reason: parsed?.hookSpecificOutput?.permissionDecisionReason ?? "",
+    updated: parsed?.hookSpecificOutput?.updatedInput?.command ?? null };
+}
+
+// deny 规则必须对"非内部工具"同样生效。曾经的实现先判 needsGate 再判策略，
+// 导致 rm -rf / 这类系统级危险命令根本到不了策略引擎、被直接放行。
+test("hook: 非内部工具的危险命令也要 deny（rm -rf /）", () => {
+  const r = runHook("rm -rf /");
+  assert.equal(r.decision, "deny");
+  assert.match(r.reason, /rm -rf/);
+});
+test("hook: 危险命令 deny 时带定制提示语", () => {
+  const r = runHook("DROP TABLE orders");
+  assert.equal(r.decision, "deny");
+  assert.match(r.reason, /DROP/);
+});
+// ask 档在 hook 路径上曾整条被忽略（只处理 deny），等于确认机制不存在。
+test("hook: ask 规则转成宿主确认（git reset --hard）", () => {
+  const r = runHook("git reset --hard");
+  assert.equal(r.decision, "ask");
+  assert.match(r.reason, /丢弃|工作区/);
+});
+// 内部工具命令要被改写成 vigile run，才能真正拿到 exit_code/耗时/输出摘要。
+test("hook: 内部工具命令改写为 vigile run", () => {
+  const r = runHook("shandian status");
+  assert.equal(r.decision, "allow");
+  assert.match(r.updated || "", /run --quiet -- shandian status$/);
+});
+test("hook: 复合命令不改写（避免破坏管道语义）", () => {
+  const r = runHook("kubectl get pods | head -5");
+  assert.equal(r.out.trim(), "");
+});
+test("hook: 无关命令不干预", () => {
+  const r = runHook("git log -3");
+  assert.equal(r.out.trim(), "");
+});
+// dsh 桥不支持 updatedInput，必须降级为旁路记录而非改写。
+test("hook: dsh 模式不改写命令", () => {
+  const r = runHook("shandian status", "dsh");
+  assert.equal(r.out.trim(), "");
+});
