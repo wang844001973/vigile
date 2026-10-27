@@ -141,6 +141,7 @@ function cmdRun(args) {
 
 // ---------------------------------------------------------------- 查询类命令
 function cmdLogs(args) {
+  if (args.web) return cmdWeb(args);
   const db = connect();
   const { clause, params } = buildFilters(args);
   const rows = db.prepare(`SELECT * FROM audit_log${clause} ORDER BY ts_epoch DESC LIMIT ?`)
@@ -149,6 +150,20 @@ function cmdLogs(args) {
   if (!rows.length) return out("（无记录）");
   rows.forEach(r => out(fmtRow(r)));
   return EXIT_OK;
+}
+
+// ---------------------------------------------------------------- Web 控制台
+function cmdWeb(args) {
+  // vig logs --web [--port 8433] — 本地站点呈现整个审计库。
+  // 只绑 127.0.0.1：审计数据含内部系统调用细节，绝不对局域网开放。
+  const port = Number(args.port) > 0 ? Number(args.port) : 8433;
+  return import("../src/web.js").then(m => m.serveWeb({ port })).then(({ url, db }) => {
+    out(`vigile 审计控制台已启动`);
+    out(`  地址:  ${url}   （浏览器打开）`);
+    out(`  数据:  ${db}`);
+    out(`  Ctrl+C 停止`);
+    return new Promise(() => {});   // 长驻
+  });
 }
 
 function cmdGet(args) {
@@ -431,7 +446,7 @@ function parseArgs(argv) {
     "--force": ["force", true], "--no-policy": ["noPolicy", true],
     "--no-existing": ["noExisting", true], "--list": ["list", true],
     "--install": ["install", true], "--uninstall": ["uninstall", true],
-    "--setup-status": ["status", true],
+    "--setup-status": ["status", true], "--web": ["web", true],
   };
   const valued = {
     "--case": "case", "--ticket": "ticket", "--tool": "tool", "--action": "action",
@@ -442,7 +457,7 @@ function parseArgs(argv) {
     "--since": "since", "--keyword": "keyword", "--file": "file", "--op": "op",
     "--before": "before", "--after": "after", "--keep": "keep", "--format": "format",
     "--out": "out", "--interval": "interval", "--lines": "lines", "--agent": "agent",
-    "--test": "test", "--filename": "filename", "--source": "source",
+    "--test": "test", "--filename": "filename", "--source": "source", "--port": "port",
   };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
