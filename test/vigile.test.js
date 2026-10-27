@@ -259,11 +259,40 @@ test("hook: ask 规则转成宿主确认（git reset --hard）", () => {
   assert.equal(r.decision, "ask");
   assert.match(r.reason, /丢弃|工作区/);
 });
-// 内部工具命令要被改写成 vigile run，才能真正拿到 exit_code/耗时/输出摘要。
-test("hook: 内部工具命令改写为 vigile run", () => {
+// 只返回 ask 不带改写时，用户批准后命令按原样执行，审计库只剩"曾经问过"。
+// ask 与 updatedInput 可以共存（zcode 先应用改写再做权限判定），批准后仍走 vig 代理。
+test("hook: ask 同时带改写，批准后仍会被审计", () => {
+  const r = runHook("git reset --hard");
+  assert.equal(r.decision, "ask");
+  assert.match(r.updated || "", /vig.*git reset --hard$/);
+});
+test("hook: ask 的破坏性 kubectl 也带改写", () => {
+  const r = runHook("kubectl delete pod x");
+  assert.equal(r.decision, "ask");
+  assert.match(r.updated || "", /vig.*kubectl delete pod x$/);
+});
+// 复合命令不能改写，ask 也就不该带改写（否则会改变管道语义）。
+test("hook: 复合命令的 ask 不带改写", () => {
+  const r = runHook("git reset --hard && echo done");
+  assert.equal(r.updated, null);
+});
+// 内部工具命令要被改写成 vig 代理，才能真正拿到 exit_code/耗时/输出摘要。
+test("hook: 内部工具命令改写为 vig 代理", () => {
   const r = runHook("shandian status");
   assert.equal(r.decision, "allow");
-  assert.match(r.updated || "", /run --quiet -- shandian status$/);
+  assert.match(r.updated || "", /vig.*shandian status$/);
+});
+// VIGILE_CONFIRM 会自动通过 ask 档；hook 把命令转成显式 allow，等于放松审批门。
+// 继承自 shell 环境的该变量必须在改写时剥掉（rtk 同款消毒）。
+test("hook: 改写串消毒 VIGILE_CONFIRM（防环境穿透）", () => {
+  const r = runHook("shandian status");
+  assert.match(r.updated || "", /^env -u VIGILE_CONFIRM -u GATE_CONFIRM -u AUDIT_CONFIRM /);
+});
+// 改写串污染了环境也必须仍然可执行：env -u 在 bash 下有效，命令本身用 bash -c 语义检验。
+test("hook: 改写串是可执行的 shell 形态（首词是 env）", () => {
+  const r = runHook("shandian status");
+  const first = (r.updated || "").split(/\s+/)[0];
+  assert.equal(first, "env");
 });
 test("hook: 复合命令不改写（避免破坏管道语义）", () => {
   const r = runHook("kubectl get pods | head -5");
@@ -277,4 +306,28 @@ test("hook: 无关命令不干预", () => {
 test("hook: dsh 模式不改写命令", () => {
   const r = runHook("shandian status", "dsh");
   assert.equal(r.out.trim(), "");
+});
+
+// ================================================================ vig 代理形态
+// vig shandian status == vigile run --quiet -- shandian status（rtk 式用法）。
+// 危险模式拆开构造，避免本测试源码里的字面量被真实 hook 拦截。
+test("CLI 代理: 不命中子命令即执行并审计", () => {
+  const r = cli(["kubectl", "version", "--client"]);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /Client Version/);
+});
+test("CLI 代理: 撞名逃逸（-- 前缀强制代理）", () => {
+  const r = cli(["--", "git", "status"]);
+  assert.equal(r.code, 0);   // E:/Code/work 非 git 仓库也没关系，只要不是用法错误
+});
+test("CLI 代理: 危险命令照样被策略拒绝", () => {
+  const bad = ["rm", "-r" + "f", "/definitely/nonexistent"];
+  const r = cli(bad);
+  assert.equal(r.code, 3);
+  assert.match(r.err, /策略拒绝|已拒绝/);
+});
+test("CLI 代理: 子命令仍走原分支", () => {
+  const r = cli(["policy", "--test", "kubectl get pods"]);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /allow/);
 });

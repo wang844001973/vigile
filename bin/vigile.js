@@ -452,26 +452,51 @@ const HELP = `vigile — 守夜人：AI agent 内部调用的统一入口（审�
 
 用法: vigile <命令> [选项]
 
+代理:  vigile shandian status      直接执行并审计（rtk 式，无需 run --）
+      vigile -- kubectl get pods   显式代理（命令名撞子命令时用）
+
 审计:  run / call / call-file-change / logs / tail / get / export
 分析:  stats / slow / errors / by-case / timeline / session / diff
 安全:  policy / verify
 配置:  rules / setup / prune
 
 常用:
-  vigile run -- <命令>              过闸：执行 + 审计 + 审核
-  vigile run --case X --ticket Y -- <命令>
+  vig shandian status               代理：执行 + 审计 + 审核（推荐日常形态）
+  vigile run --case X --ticket Y -- <命令>   带工单上下文执行
   vigile tail                       实时跟踪
   vigile logs --since 2h            查询
   vigile policy --test "rm -rf /"   只看判定
   vigile setup --install --agent all
 `;
 
+// 保留子命令：命中则走功能分支；不命中则视为代理命令（vig shandian status）。
+// 这是 rtk 式用法：不带 run --，第一个词就是真实命令。
+const RESERVED = new Set([
+  "run", "call", "call-file-change", "logs", "tail", "get", "stats", "slow",
+  "errors", "by-case", "timeline", "session", "diff", "export", "verify",
+  "policy", "rules", "setup", "prune",
+  "-h", "--help", "help", "--version", "-V", "--", "-y", "--yes", "--quiet", "--json",
+]);
+
 async function main() {
   const argv = process.argv.slice(2);
   if (!argv.length || argv[0] === "-h" || argv[0] === "--help" || argv[0] === "help") {
     out(HELP); return EXIT_OK;
   }
-  if (argv[0] === "--version" || argv[0] === "-V") { out("vigile 1.0.0"); return EXIT_OK; }
+  if (argv[0] === "--version" || argv[0] === "-V") { out("vigile 1.1.0"); return EXIT_OK; }
+
+  // 代理形态：vig shandian status == vigile run --quiet -- shandian status。
+  // 显式 `--` 前缀（vig -- rm -rf x）也进这里，避免有人真想执行叫 run/logs 的程序时被吞。
+  // `-y`/`--quiet` 等首个 flag 同理：flags 后面才是命令，parseArgs 能正常处理。
+  if (!RESERVED.has(argv[0]) || argv[0] === "--") {
+    const proxyIdx = argv[0] === "--" ? 1 : 0;
+    const rest = argv.slice(proxyIdx);
+    if (rest.length) {
+      return cmdRun({ rest, quiet: true, yes: false, case: undefined, ticket: undefined,
+        noPolicy: undefined, _: [], limit: 50, interval: 1, lines: 10, format: "json" });
+    }
+    err("用法: vig -- <命令...>"); return EXIT_USAGE;
+  }
 
   const { cmd, args } = parseArgs(argv);
   try {
