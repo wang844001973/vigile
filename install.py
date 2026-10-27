@@ -39,12 +39,16 @@ def script_path() -> str:
 
 
 def write_entry(target: str, py: str) -> None:
+    """生成 CLI 入口。同时把 vigile.py 复制到安装目录，使入口独立于仓库位置——
+    仓库移动/删除后命令仍可用（升级方式：仓库里重新 python install.py）。"""
     os.makedirs(os.path.dirname(target), exist_ok=True)
-    vigile_py = script_path()
+    bdir = os.path.dirname(target)
+    local_py = os.path.join(bdir, "vigile.py")
+    shutil.copyfile(script_path(), local_py)
     if target.endswith(".cmd"):
-        content = f'@echo off\r\n"{py}" "{vigile_py}" %*\r\n'
+        content = f'@echo off\r\n"{py}" "{local_py}" %*\r\n'
     else:
-        content = f'#!/bin/sh\nexec "{py}" "{vigile_py}" "$@"\n'
+        content = f'#!/bin/sh\nexec "{py}" "{local_py}" "$@"\n'
     with open(target, "w", encoding="utf-8", newline="") as fh:
         fh.write(content)
     if not target.endswith(".cmd"):

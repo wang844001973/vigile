@@ -466,8 +466,12 @@ def record(conn: sqlite3.Connection, **kw: Any) -> int:
 # 参考 Anthropic blast-radius mod 的思路：用工具自身的 dry-run/status 能力测影响。
 
 def _msys_path(path: str) -> str:
-    """Git Bash/MSYS 传来的 /tmp /usr/... 转成 Windows 实际路径。"""
-    if not path.startswith("/"):
+    """Git Bash/MSYS 传来的 /tmp、/c/... 转成 Windows 实际路径。
+
+    仅在 Windows 上生效：Linux/macOS 上 /tmp 就是真临时目录、/c/... 就是普通绝对路径，
+    原样返回才是正确行为。
+    """
+    if os.name != "nt" or not path.startswith("/"):
         return path
     # /tmp 与 /var/tmp → 用户临时目录
     if path.startswith("/tmp/") or path == "/tmp":

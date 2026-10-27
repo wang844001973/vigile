@@ -481,13 +481,21 @@ class TestBlastRadius(Base):
         self.assertIsNone(au.blast_radius(["rm", "-rf", "/no/such/dir/xyz"]))
 
     def test_msys_tmp_path_conversion(self):
-        # Git Bash 的 /tmp/x 应转换到 Windows 临时目录
+        # Git Bash 的 /tmp/x 应转换到 Windows 临时目录。
+        # Linux 上 /tmp 本来就是真临时目录，原样返回是正确行为。
         converted = au._msys_path("/tmp/abc")
-        self.assertNotIn("/tmp", converted)
-        self.assertTrue(os.path.isabs(converted))
+        if os.name == "nt":
+            self.assertNotIn("/tmp", converted)
+            self.assertTrue(os.path.isabs(converted))
+        else:
+            self.assertEqual(converted, "/tmp/abc")
 
     def test_msys_drive_path(self):
-        self.assertEqual(au._msys_path("/c/Users/x"), "C:/Users/x")
+        # MSYS 的 /c/... 盘符转换只在 Windows 有意义；Linux 上不是盘符路径
+        if os.name == "nt":
+            self.assertEqual(au._msys_path("/c/Users/x"), "C:/Users/x")
+        else:
+            self.assertEqual(au._msys_path("/c/Users/x"), "/c/Users/x")
 
     def test_drop_table_impact(self):
         v = au.blast_radius(["psql", "-c", "drop table users"])

@@ -26,11 +26,17 @@ function detectMode() {
 }
 const MODE = detectMode();
 
-// gate 脚本与 Python 解释器路径
-const VIGILE_SCRIPT = process.env.VIGILE_SCRIPT
-  || 'E:/Code/vigile/scripts/vigile.py'
-  || 'E:/Code/vigile/scripts/vigile.py';
-const PYTHON = process.env.VIGILE_PYTHON || 'python';
+// vigile 脚本路径：优先环境变量；否则从 hook 自身位置向上推导
+// （hooks/vigile-hook.js → 上两级 = 仓库根 → scripts/vigile.py），
+// 与 clone 到哪里无关，Windows/WSL/macOS 通用。
+const VIGILE_SCRIPT = process.env.VIGILE_SCRIPT || (() => {
+  const here = __dirname.replace(/\\/g, '/');
+  return require('path').join(here, '..', 'scripts', 'vigile.py');
+})();
+// 解释器：Windows 上 python3 常是 WindowsApps 空壳，故默认 python；
+// Linux/macOS 惯例是 python3。可用 VIGILE_PYTHON 覆盖。
+const PYTHON = process.env.VIGILE_PYTHON
+  || (process.platform === 'win32' ? 'python' : 'python3');
 
 // ---- 需要审计的命令（工具名 → 是否需要包装） ----
 // 匹配命令的第一个 token（允许带路径与 .exe）
