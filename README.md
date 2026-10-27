@@ -212,6 +212,30 @@ vig session 84400@123/multica:T-9876
 
 普通进程（无编排层变量）行为完全不变。
 
+## 全量审计（任何终端命令都有记录）
+
+默认 `audit_mode: "all"`：**白名单只决定"是否改写拿到完整结果"，记录面覆盖一切命令**。
+
+- 白名单内（shandian/kubectl/jira…）→ hook 改写为 `vig` 代理 → 完整审计
+  （exit_code / 耗时 / 输出摘要，`source=cli`）
+- 白名单外（git/npm/node/cargo…）→ 命令照原样执行，旁路记一条意图
+  （`source=hook`，`meta.source=hook-bypass`）——行为零影响，但库里可查
+- 复合命令（含管道/`&&`）→ 首段过策略检查后旁路记录
+
+高频纯只读命令在**噪声名单**里，不记录（防止灌库）：`ls / pwd / cat / head /
+tail / grep / find / which / whoami / date / echo / wc / stat / du / df`。
+
+`~/.vigile/rules.json` 可调：
+
+```json
+{
+  "audit_mode": "all",        // all = 全量（默认）；whitelist = 只记内部工具
+  "noise": ["ls", "cat"]      // 噪声名单；置 [] = 一条不漏全记
+}
+```
+
+改完即生效（hook 每次调用都重读配置，无需重启 agent）。
+
 ## 环境变量
 
 `VIGILE_DB` / `VIGILE_ACTOR` / `VIGILE_SESSION` / `VIGILE_CASE` / `VIGILE_TICKET`
