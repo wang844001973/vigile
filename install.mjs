@@ -65,6 +65,22 @@ for (const t of entries(dir)) {
   }
 }
 
+// Windows 下清理 Git Bash 时代遗留的无扩展名 shim。
+// 那类文件是 sh 脚本，PowerShell 会把它当"文档"执行并报
+// 「无法在管道中间运行文档」；而它若在 PATH 中排在 .cmd 之前，
+// 还会遮蔽掉正确的入口 —— CMD 里敲 vig 也一起坏掉。
+if (os.platform() === "win32") {
+  for (const legacy of ["vig", "vigile"]) {
+    const p = path.join(dir, legacy);
+    if (!fs.existsSync(p)) continue;
+    let head = "";
+    try { head = fs.readFileSync(p, "utf8").slice(0, 40); } catch { continue; }
+    if (!head.startsWith("#!")) continue;   // 不是 sh 脚本就别动
+    console.log(`${dry ? "[dry-run] 将删除" : "清理遗留 shim"} ${p}`);
+    if (!dry) { try { fs.rmSync(p); } catch { /* 权限不足就算了，下面会警告 */ } }
+  }
+}
+
 if (!dry) console.log("安装完成。");
 if (!inPath(dir)) {
   console.log("\n⚠ 该目录不在 PATH 中，请加入：");
@@ -76,6 +92,28 @@ if (!inPath(dir)) {
 } else {
   console.log("PATH 已包含该目录，可直接运行: vig --help");
 }
+
+// PATH 里若还有别的 vig/vigile（常见于 Git Bash 时代的 ~/.local/bin），
+// 谁排在前面谁生效 —— 排在 .cmd 之前的 sh 脚本会让 PowerShell 报错、
+// 在 CMD 里也可能遮蔽正确入口。这里主动查出来告诉用户。
+if (os.platform() === "win32") {
+  const conflicts = [];
+  for (const part of (process.env.PATH || "").split(path.delimiter)) {
+    if (!part) continue;
+    if (path.normalize(part.toLowerCase()) === path.normalize(dir.toLowerCase())) continue;
+    for (const name of ["vig", "vigile"]) {
+      const p = path.join(part, name);
+      if (fs.existsSync(p)) conflicts.push(p);
+    }
+  }
+  if (conflicts.length) {
+    console.log("\n⚠ 发现其他 vig/vigile 入口，可能遮蔽本安装（按 PATH 顺序先生效）：");
+    for (const c of conflicts) console.log(`   ${c}`);
+    console.log("   建议删除上面这些旧入口（多为早期 Git Bash 版 sh 脚本），");
+    console.log("   PowerShell 遇到无扩展名的 sh 脚本会报「无法在管道中间运行文档」。");
+  }
+}
+
 console.log("\n下一步:");
 console.log("  vig --help          全部命令");
 console.log("  vig setup --install --agent all   给 agent 装 hook");
