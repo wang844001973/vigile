@@ -368,3 +368,12 @@ test("install.sh: 覆盖 node 版本检查/tar 安全/真实下载地址", () =>
   assert.match(sh, /tar -tzf.*grep -qE/);                    // tar 路径穿越检查存在
   assert.match(sh, /releases\/latest/);                      // 版本发现
 });
+
+// Windows 上无扩展名的 sh 脚本 shim 会被 PowerShell 当"文档"执行并报
+// 「无法在管道中间运行文档」；若它排在 .cmd 之前，CMD 也会被遮蔽。
+// 安装器必须清理自己目录里的这类遗留，并报告 PATH 中其他冲突入口。
+test("install.mjs: Windows 清理遗留 sh shim 并报告 PATH 冲突", () => {
+  const m = fs.readFileSync(path.join(ROOT, "..", "install.mjs"), "utf8");
+  assert.match(m, /startsWith\("#!"\)/);                     // 只删 sh 脚本
+  assert.match(m, /发现其他 vig\/vigile 入口/);               // 冲突报告
+});
