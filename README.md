@@ -38,6 +38,10 @@ AI agent 排查线上问题时会调用大量工具：查日志、查数据库�
 
 Python 3.7+，**无第三方依赖**。
 
+**平台支持**：Linux ✅（Ubuntu 22.04 / Python 3.12 实测）、Windows ✅（含 CMD/Git Bash 双入口）、
+macOS ✅（POSIX 同 Linux；默认用 `python3`）。CLI 入口由 `install.py` 安装时自动生成，
+且 `vigile.py` 会复制到安装目录——仓库移动/删除后 `vig` 命令依然可用。
+
 ```bash
 git clone <this-repo> vigile
 cd vigile
