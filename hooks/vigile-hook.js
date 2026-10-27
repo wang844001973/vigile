@@ -237,8 +237,12 @@ function decide(raw) {
   const parts = cmd.trim().split(/\s+/);
   const verdict = evaluate(parts[0] || "", parts, cmd);
   if (verdict.decision === "deny") {
-    // 被拒也要留痕：命令不会执行，但"有人试图执行"是重要审计事实
-    recordIntent(cmd, "denied", `[策略拒绝/${verdict.ruleId}] ${verdict.message}`, hostMode);
+    // 归属到真正违规的命令段，而不是整条复合命令的首段。
+    // 否则 `cd /tmp && rm -rf x` 会被记成"cd 被拒绝"，看日志的人一头雾水。
+    const culprit = culpritOf(cmd, verdict);
+    recordIntent(cmd, "denied",
+      `[策略拒绝/${verdict.ruleId}] ${verdict.message}`, hostMode,
+      { tool: culprit.tool, action: culprit.action, target: culprit.target });
     deny(`[vigile 策略拒绝] ${verdict.message}${verdict.hint ? " 建议：" + verdict.hint : ""}`);
   }
 
@@ -313,20 +317,64 @@ function detectHostMode(payload) {
   return MODE;
 }
 
-/** 旁路记录：宿主不支持命令改写时，由 hook 直接写入审计库。 */
-function recordIntent(cmd, status, error, host) {
+/** 在一整条命令里定位真正触发策略的那一段。
+ *  复合命令 `cd /tmp && rm -rf x` 的首段是 cd，但违规的是 rm -rf；
+ *  审计里必须记 rm，否则"cd 被拒绝"这类记录会彻底误导排查。
+ *  依据 verdict.match（引擎已返回的正则命中片段）在命令中定位，
+ *  取该片段所在的那一个 shell 段。 */
+function culpritOf(cmd, verdict) {
+  const fallback = { tool: baseName(firstToken(cmd) || "unknown"),
+    action: cmd.trim().split(/\s+/)[1] || "", target: "" };
+  const match = (verdict && verdict.match) ? String(verdict.match).trim() : "";
+  if (!match) return fallback;
+  const at = cmd.indexOf(match);
+  if (at < 0) return fallback;
+
+  // 按 shell 分隔符切段（&& || ; | 换行），保留各段起止位置
+  const segs = [];
+  let start = 0;
+  for (let i = 0; i < cmd.length; i++) {
+    const two = cmd.slice(i, i + 2);
+    if (two === "&&" || two === "||") { segs.push([start, i]); i++; start = i + 1; }
+    else if (cmd[i] === ";" || cmd[i] === "|" || cmd[i] === "\n") { segs.push([start, i]); start = i + 1; }
+  }
+  segs.push([start, cmd.length]);
+
+  const seg = segs.find(([a, b]) => at >= a && at < b);
+  if (!seg) return fallback;
+  const text = cmd.slice(seg[0], seg[1]).trim();
+  if (!text) return fallback;
+  const toks = text.split(/\s+/).map(t => t.replace(/^["']|["']$/g, ""));
+  const tool = baseName(toks[0] || "unknown");
+  return {
+    tool,
+    action: toks[1] || "",
+    // target：动作之后的第一个非选项参数（rm -rf /tmp/x → /tmp/x）
+    target: (toks.slice(2).find(t => t && !t.startsWith("-")) || "").slice(0, 200),
+  };
+}
+
+/** 旁路记录：宿主不支持命令改写时，由 hook 直接写入审计库。
+ *  override 允许把记录归属到具体违规段（见 culpritOf）。 */
+function recordIntent(cmd, status, error, host, override) {
   try {
     const parts = cmd.trim().split(/\s+/);
+    const tool = (override && override.tool) || baseName(parts[0] || "unknown");
     spawnSync(process.execPath, [VIGILE_SCRIPT, "call",
       "--source", "hook",
-      "--tool", baseName(parts[0] || "unknown"),
-      "--action", parts[1] || "",
-      "--category", inferCategory(parts[0] || "unknown", cmd),
+      "--tool", tool,
+      "--action", (override && override.action !== undefined) ? override.action : (parts[1] || ""),
+      "--category", inferCategory(tool, cmd),
       "--status", status,
       "--duration", "0",
-      "--risk", inferRisk(parts[0] || "unknown", cmd),
+      "--risk", inferRisk(tool, cmd),
+      ...((override && override.target) ? ["--target", override.target] : []),
       "--args", JSON.stringify({ argv: parts, mode: MODE }),
-      "--meta", JSON.stringify({ source: "hook-bypass", host: host || MODE }),
+      "--meta", JSON.stringify({
+        source: "hook-bypass", host: host || MODE,
+        // 复合命令被拒时，让后来人知道整条命令长什么样、违规的是哪一段
+        ...((override && override.tool) ? { full_command: cmd.slice(0, 500), attributed_to: override.tool } : {}),
+      }),
       ...(error ? ["--error", error] : []),
     ], { timeout: 5000, stdio: "ignore" });
   } catch { /* 审计失败绝不影响主流程 */ }
