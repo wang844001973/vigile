@@ -8,7 +8,9 @@
 // 用法:
 //   node vigile-hook.js            # PreToolUse（Bash 拦截/改写）
 //   node vigile-hook.js --post     # PostToolUse（Edit/Write 文件变更 diff）
-//   VIGILE_HOOK_MODE=claude        # Claude 系（支持 updatedInput 改写）；默认 zcode（仅提醒+deny）
+//   node vigile-hook.js --mode claude   # Claude 系（支持 updatedInput 改写）
+//   node vigile-hook.js --mode dsh      # dsh 桥（仅旁路记录）
+//   不传则按环境推断，默认 zcode
 
 import fs from "node:fs";
 import os from "node:os";
@@ -25,8 +27,13 @@ const IS_POST = process.argv.includes("--post");
 // 宿主能力模式（决定 hook 能做什么，见 decide() 里的降级分支）：
 //   claude / zcode —— 支持 PreToolUse 的 updatedInput，可改写命令 → 完整审计
 //   dsh            —— 桥不支持 updatedInput/additionalContext → 仅旁路记录意图 + deny
-// 默认按环境推断；dsh 时通常会带 MULTICA_* 或 dsh 相关变量。
-const MODE = process.env.VIGILE_HOOK_MODE
+// 优先取 --mode 参数：Windows 的 cmd.exe 不认 `VAR=value cmd` 前缀，把模式
+// 塞进环境变量会让 hook 整条失效（而且错误被吞掉）。参数形式跨 shell 通用。
+const ARG_MODE = (() => {
+  const i = process.argv.indexOf("--mode");
+  return i >= 0 ? process.argv[i + 1] : "";
+})();
+const MODE = process.env.VIGILE_HOOK_MODE || ARG_MODE
   || (process.env.CLAUDE_PROJECT_DIR && !process.env.ZCODE_PROJECT_DIR ? "claude"
     : process.env.DSH_PROFILE || process.env.DSH_HOME ? "dsh"
     : "zcode");
@@ -268,8 +275,9 @@ function decide(raw) {
  *  且不带 permission_mode / prompt_id。Claude Code 会给真实路径。
  *  返回 "claude"（可改写）或 "dsh"（只能旁路记录）。 */
 function detectHostMode(payload) {
-  if (process.env.VIGILE_HOOK_MODE === "dsh") return "dsh";
-  if (process.env.VIGILE_HOOK_MODE === "zcode") return "zcode";
+  // MODE 已含 --mode 参数（Windows 下靠参数而非环境变量传宿主）
+  if (MODE === "dsh") return "dsh";
+  if (MODE === "zcode") return "zcode";
   // 显式指定 claude 也要复核：dsh 复用同一份 settings.json
   if (payload && payload.transcript_path === "") return "dsh";
   if (MODE === "claude") return "claude";

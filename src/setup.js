@@ -62,9 +62,12 @@ REGISTRY.zcode = {
 };
 
 // ---------------------------------------------------------------- Claude/Codex：command 型
-function makeCompat(sub, file) {
+// 模式经 --mode 参数传递，不用 `VAR=value cmd` 前缀：Windows cmd.exe 不认该语法，
+// 会把整条 hook 变成 "VAR 不是内部或外部命令" 且静默失效。参数形式跨 shell 通用。
+function makeCompat(sub, file, hostMode) {
   const cfg = () => home(sub, file);
   const hasVigileCmd = (e) => (e.hooks || []).some(h => (h.command || "").includes("vigile-hook.js"));
+  const preCommand = `"${NODE}" "${HOOK_PATH}" --mode ${hostMode}`;
   return {
     detect: () => fs.existsSync(cfg()),
     install() {
@@ -73,7 +76,7 @@ function makeCompat(sub, file) {
       d.hooks = d.hooks || {};
       d.hooks.PreToolUse = d.hooks.PreToolUse || [];
       if (!d.hooks.PreToolUse.some(hasVigileCmd)) {
-        d.hooks.PreToolUse.unshift({ matcher: "Bash", hooks: [{ type: "command", command: `VIGILE_HOOK_MODE=claude "${NODE}" "${HOOK_PATH}"` }] });
+        d.hooks.PreToolUse.unshift({ matcher: "Bash", hooks: [{ type: "command", command: preCommand }] });
       }
       d.hooks.PostToolUse = d.hooks.PostToolUse || [];
       if (!d.hooks.PostToolUse.some(hasVigileCmd)) {
@@ -104,8 +107,8 @@ function makeCompat(sub, file) {
     },
   };
 }
-REGISTRY.claude = makeCompat(".claude", "settings.json");
-REGISTRY.codex = makeCompat(".codex", "hooks.json");
+REGISTRY.claude = makeCompat(".claude", "settings.json", "claude");
+REGISTRY.codex = makeCompat(".codex", "hooks.json", "claude");
 
 // ---------------------------------------------------------------- dsh：桥插件
 function dshProfiles() {
