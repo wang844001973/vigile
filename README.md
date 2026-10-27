@@ -59,8 +59,20 @@ vig init --global
 ```powershell
 git clone https://github.com/wang844001973/vigile.git "$env:LOCALAPPDATA\Programs\vigile-src"
 node "$env:LOCALAPPDATA\Programs\vigile-src\install.mjs"
-# install.mjs 生成 vigile.cmd / vig.cmd 并提示 PATH 设置（setx 后重开终端）
 ```
+
+install.mjs 在 Windows 上做三件事：
+
+- 生成 `%LOCALAPPDATA%\Programs\vigile\{vigile,vig}.cmd`（CMD / PowerShell 入口）
+- 生成 `~/.local/bin/{vigile,vig}` sh 脚本（Git Bash 入口）
+- 把 .cmd 目录**挪到用户 PATH 首位**——顺序很关键：`.local\bin` 若排在前面，
+  PowerShell 会命中那里的 sh 脚本并报「无法在管道中间运行文档」
+
+装完**重开终端**（PATH 改动只对新进程生效）。
+
+> 常见坑：`vib` 不是本工具，命令是 `vig`（v-i-g）；
+> 端口被占（EADDRINUSE）说明已有一个控制台在跑，浏览器直接开
+> http://127.0.0.1:8433 或 `--port` 换端口。
 
 **从源码**（开发者）：
 

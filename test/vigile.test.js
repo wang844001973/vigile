@@ -369,13 +369,15 @@ test("install.sh: 覆盖 node 版本检查/tar 安全/真实下载地址", () =>
   assert.match(sh, /releases\/latest/);                      // 版本发现
 });
 
-// Windows 上无扩展名的 sh 脚本 shim 会被 PowerShell 当"文档"执行并报
-// 「无法在管道中间运行文档」；若它排在 .cmd 之前，CMD 也会被遮蔽。
-// 安装器必须清理自己目录里的这类遗留，并报告 PATH 中其他冲突入口。
-test("install.mjs: Windows 清理遗留 sh shim 并报告 PATH 冲突", () => {
+// Windows 双入口：CMD/PowerShell 用 .cmd，Git Bash 需要无扩展名 sh 脚本。
+// 曾用"清理 sh shim"的方式修 PowerShell 报错，结果删掉了 Git Bash 的唯一入口
+// （vig 在 Git Bash command not found）——那是误伤。正确姿势：接管生成
+// sh 入口放 ~/.local/bin，同时把 .cmd 目录挪到用户 PATH 首位。
+test("install.mjs: Windows 双入口生成 + PATH 首位", () => {
   const m = fs.readFileSync(path.join(ROOT, "..", "install.mjs"), "utf8");
-  assert.match(m, /startsWith\("#!"\)/);                     // 只删 sh 脚本
-  assert.match(m, /发现其他 vig\/vigile 入口/);               // 冲突报告
+  assert.match(m, /Git Bash 入口/);                          // 接管生成 sh 入口
+  assert.match(m, /ensureUserPathFirst/);                     // .cmd 目录挪首位
+  assert.doesNotMatch(m, /清理遗留/);                         // 不再误删
 });
 
 // ================================================================ Web 控制台
