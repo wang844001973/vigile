@@ -28,8 +28,8 @@ const MODE = detectMode();
 
 // gate 脚本与 Python 解释器路径
 const VIGILE_SCRIPT = process.env.VIGILE_SCRIPT
-  || 'C:/Users/84400/.agents/skills/vigile/scripts/vigile.py'
-  || 'C:/Users/84400/.agents/skills/vigile/scripts/vigile.py';
+  || 'E:/Code/vigile/scripts/vigile.py'
+  || 'E:/Code/vigile/scripts/vigile.py';
 const PYTHON = process.env.VIGILE_PYTHON || 'python';
 
 // ---- 需要审计的命令（工具名 → 是否需要包装） ----
