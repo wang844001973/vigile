@@ -225,14 +225,16 @@ test("hash 链: 兼容 Python 版历史算法（exit_code=0 归一差异）", ()
 // ================================================================ hook 判定
 const HOOK = path.join(ROOT, "..", "hooks", "vigile-hook.js");
 
+// 模式经 --mode 参数传递（Windows cmd.exe 不认 `VAR=value cmd` 前缀，那会让
+// 整条 hook 静默失效）。runHook 默认走参数形式，与安装器写出的命令一致。
 function runHook(command, mode = "zcode", extraEnv = {}) {
   const payload = JSON.stringify({
     hook_event_name: "PreToolUse", tool_name: "Bash",
     tool_input: { command }, transcript_path: "C:/tmp/x.jsonl",
   });
-  const r = spawnSync(process.execPath, [HOOK], {
+  const r = spawnSync(process.execPath, [HOOK, "--mode", mode], {
     encoding: "utf8", input: payload,
-    env: { ...process.env, VIGILE_HOOK_MODE: mode, ...extraEnv },
+    env: { ...process.env, VIGILE_HOOK_MODE: "", ...extraEnv },
   });
   let parsed = null;
   try { parsed = JSON.parse(r.stdout); } catch { /* 空输出即"不干预" */ }
@@ -306,6 +308,20 @@ test("hook: 无关命令不干预", () => {
 test("hook: dsh 模式不改写命令", () => {
   const r = runHook("shandian status", "dsh");
   assert.equal(r.out.trim(), "");
+});
+// claude 模式经 --mode 参数生效（不依赖环境变量）。
+test("hook: --mode claude 使能改写（参数形式，跨 shell 通用）", () => {
+  const r = runHook("shandian status", "claude");
+  assert.equal(r.decision, "allow");
+  assert.match(r.updated || "", /vig.*shandian status$/);
+});
+
+// 安装器写出的 hook 命令必须跨 shell 可用：不得含 `VAR=value cmd` 前缀
+// （Windows cmd.exe 不认，会让 hook 静默失效）。
+test("setup: claude hook 命令用 --mode 参数而非环境变量前缀", () => {
+  const setup = fs.readFileSync(path.join(ROOT, "..", "src", "setup.js"), "utf8");
+  assert.match(setup, /--mode \$\{hostMode\}/);
+  assert.doesNotMatch(setup, /VIGILE_HOOK_MODE=/);
 });
 
 // ================================================================ vig 代理形态
