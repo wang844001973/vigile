@@ -1,6 +1,6 @@
 {
   "name": "vigile",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "守夜人 — AI agent 内部调用的统一入口：审计 + 执行前审核",
   "type": "module",
   "engines": { "node": ">=22.5.0" },
