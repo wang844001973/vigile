@@ -79,8 +79,17 @@ function cmdRun(args) {
   if (argv[0] === "--") argv = argv.slice(1);
   if (!argv.length) { err("用法: vigile run [--case X] [--ticket Y] -- <命令...>"); return EXIT_USAGE; }
 
-  const tool = argv[0];
+  // --shell：hook 对复合命令的改写形态（vig --shell -- <整条含管道命令>）。
+  // 逐词 spawn 无法表达管道；用整串交给 shell，行为与用户手敲完全一致。
+  // 管道/重定向由 shell 处理，vigile 记录整条的退出码与 stdout 摘要。
+  const shellMode = Boolean(args.shell);
   const argsText = argv.join(" ");
+  // shell 模式下 argv[0] 是整条命令；工具名取首个 shell 段的首词，
+  // 让审计里记 `shandian` 而不是 `shandian status | head -1`。
+  const tool = shellMode
+    ? (argsText.split(/[\n;|&]+/).map(s => s.trim()).find(Boolean) || "").split(/\s+/)[0]
+    : argv[0];
+
   const category = inferCategory(tool, argsText);
   const risk = inferRisk(tool, argsText);
 
@@ -111,7 +120,11 @@ function cmdRun(args) {
   }
 
   const started = Date.now();
-  const res = spawnSync(argv[0], argv.slice(1), { encoding: "utf8", shell: false, maxBuffer: 64 * 1024 * 1024 });
+  // shell 模式：整串交给系统 shell，管道/重定向语义与用户手敲一致；
+  // 逐词模式：spawn 不经 shell（避免注入面），绝大多数命令走这条。
+  const res = shellMode
+    ? spawnSync(argsText, { encoding: "utf8", shell: true, maxBuffer: 64 * 1024 * 1024 })
+    : spawnSync(argv[0], argv.slice(1), { encoding: "utf8", shell: false, maxBuffer: 64 * 1024 * 1024 });
   const durationMs = Date.now() - started;
   const stdout = res.stdout || "", stderr = res.stderr || "";
   let status = "ok", errorText = "", exitCode = res.status;
@@ -473,7 +486,7 @@ function parseArgs(argv) {
     "--force": ["force", true], "--no-policy": ["noPolicy", true],
     "--no-existing": ["noExisting", true], "--list": ["list", true],
     "--install": ["install", true], "--uninstall": ["uninstall", true],
-    "--setup-status": ["status", true], "--web": ["web", true],
+    "--setup-status": ["status", true], "--web": ["web", true], "--shell": ["shell", true],
   };
   const valued = {
     "--case": "case", "--ticket": "ticket", "--tool": "tool", "--action": "action",
@@ -539,6 +552,8 @@ const RESERVED = new Set([
   "errors", "by-case", "timeline", "session", "diff", "export", "verify",
   "policy", "rules", "setup", "init", "prune",
   "-h", "--help", "help", "--version", "-V", "--", "-y", "--yes", "--quiet", "--json",
+  // hook 对复合命令的改写形态：vig --shell -- <整条含管道命令>
+  "--shell",
 ]);
 
 async function main() {
@@ -547,6 +562,16 @@ async function main() {
     out(HELP); return EXIT_OK;
   }
   if (argv[0] === "--version" || argv[0] === "-V") { out("vigile 1.1.0"); return EXIT_OK; }
+
+  // --shell 前缀（hook 对复合命令的改写形态）：vig --shell -- <整条命令>。
+  // 整串交给系统 shell，管道/重定向语义与用户手敲完全一致。
+  if (argv[0] === "--shell") {
+    const rest = argv.slice(1);
+    if (rest.length && rest[0] === "--") rest.shift();
+    if (!rest.length) { err("用法: vig --shell -- <整条命令>"); return EXIT_USAGE; }
+    return cmdRun({ rest, shell: true, quiet: true, yes: false, case: undefined, ticket: undefined,
+      noPolicy: undefined, _: [], limit: 50, interval: 1, lines: 10, format: "json" });
+  }
 
   // 代理形态：vig shandian status == vigile run --quiet -- shandian status。
   // 显式 `--` 前缀（vig -- rm -rf x）也进这里，避免有人真想执行叫 run/logs 的程序时被吞。

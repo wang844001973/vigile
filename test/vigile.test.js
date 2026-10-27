@@ -296,9 +296,12 @@ test("hook: 改写串是可执行的 shell 形态（首词是 env）", () => {
   const first = (r.updated || "").split(/\s+/)[0];
   assert.equal(first, "env");
 });
-test("hook: 复合命令不改写（避免破坏管道语义）", () => {
+// 行为升级：管道命令经实测语义透传不变，现在改写为 vig --shell 完整审计。
+//（旧断言"不改写"已过时，保留在 git 历史里）
+test("hook: 管道命令改写为 vig --shell", () => {
   const r = runHook("kubectl get pods | head -5");
-  assert.equal(r.out.trim(), "");
+  assert.equal(r.decision, "allow");
+  assert.match(r.updated || "", /--shell -- kubectl get pods/);
 });
 test("hook: 无关命令不干预", () => {
   const r = runHook("git log -3");
@@ -349,16 +352,44 @@ test("hook: 噪声名单命令被跳过（ls）", () => {
 });
 // 噪声与全量的区别在落库，不在 hook 输出——由 DB 集成测试与 rules.json 配置覆盖。
 
-// 复合命令不能改写（会破坏管道语义），但绝不等于不记录。
-// 真实事故：`shandian lane service-detail ... 2>&1 | tr -d '\r'` 因含管道
-// 被 isComplex 早退，整类调用成为审计盲区。
-test("hook: 带管道的内部调用仍记录（不改写但留痕）", () => {
+// 复合命令演进史：v1 直接 return（整类漏审）→ v2 旁路记录（有意图无结果）
+// → v3（当前）改写 vig --shell 拿完整审计，例外场景退旁路。
+test("hook: 带管道的内部调用升级为完整审计（--shell 改写）", () => {
   const r = runHook("shandian lane service-detail --name voc-admin 2>&1 | tr -d x");
-  assert.equal(r.out.trim(), "");   // 不改写
+  assert.equal(r.decision, "allow");
+  assert.match(r.updated || "", /--shell -- shandian/);
 });
-test("hook: 复合命令含 && 也留痕", () => {
+test("hook: && 复合同样走 --shell 改写", () => {
   const r = runHook("cd /tmp && kubectl get pods");
-  assert.equal(r.out.trim(), "");
+  assert.match(r.updated || "", /--shell -- cd \/tmp/);
+});
+test("hook: 例外场景退回旁路记录（heredoc）", () => {
+  const r = runHook("cat <<EOF | kubectl apply -f -");
+  assert.equal(r.out.trim(), "");     // 不改写 → 旁路
+});
+// 复合命令升级：实测管道经 vig 透传语义不变，可改写为 vig --shell 拿完整审计。
+// 三类例外仍走旁路记录（stdin 重定向/heredoc、流式 -f、$() 替换）。
+test("hook: 管道命令改写为 vig --shell（完整审计）", () => {
+  const r = runHook("kubectl get pods 2>&1 | head -5");
+  assert.equal(r.decision, "allow");
+  assert.match(r.updated || "", /--shell -- kubectl/);
+});
+test("hook: heredoc/stdin 重定向不改写", () => {
+  const r = runHook("mysql -u x < dump.sql");
+  assert.equal(r.updated, null);
+});
+test("hook: 流式命令(-f)不改写", () => {
+  const r = runHook("kubectl logs -f pod | head -5");
+  assert.equal(r.updated, null);
+});
+test("hook: 命令替换 $() 不改写", () => {
+  const r = runHook("echo \$(whoami)");
+  assert.equal(r.updated, null);
+});
+test("CLI --shell: 整串执行管道命令并审计", () => {
+  const r = cli(["--shell", "--", "echo", "hello", "|", "wc", "-c"]);
+  assert.equal(r.code, 0);
+  assert.match(r.out, /hello\|?|\d/);
 });
 // ================================================================ vig 代理形态
 // vig shandian status == vigile run --quiet -- shandian status（rtk 式用法）。

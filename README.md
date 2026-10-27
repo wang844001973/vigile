@@ -220,10 +220,11 @@ vig session 84400@123/multica:T-9876
   （exit_code / 耗时 / 输出摘要，`source=cli`）
 - 白名单外（git/npm/node/cargo…）→ 命令照原样执行，旁路记一条意图
   （`source=hook`，`meta.source=hook-bypass`）——行为零影响，但库里可查
-- 复合命令（含管道/`&&`/`;`）→ **不改写**（改写会破坏管道语义），
-  但按 shell 分隔符切开、**逐段记录**每次调用：
-  `shandian ... 2>&1 | tr -d '\r'` 会记下 shandian 这一段（`tr` 属噪声跳过），
-  meta 里保留整条命令原文便于还原上下文。
+- 复合命令（含管道/`&&`/`;`）→ 改写为 `vig --shell -- <整条命令>`：整串交系统
+  shell，管道语义与手敲一致（vig 透传 stdout/stderr），拿到**真实 exit_code/
+  耗时/输出摘要**。三类例外退回逐段旁路记录（改写会改变行为）：
+  stdin 重定向/heredoc（`<` `<<`）、流式命令（`-f`/`--follow`/`tail -f`）、
+  `$()` 命令替换。
 
 高频纯只读命令在**噪声名单**里，不记录（防止灌库）：`ls / pwd / cat / head /
 tail / grep / find / which / whoami / date / echo / wc / stat / du / df`，
