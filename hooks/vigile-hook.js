@@ -96,6 +96,21 @@ function loadRulesJson() {
 function auditMode() {
   return loadRulesJson().audit_mode === "whitelist" ? "whitelist" : "all";
 }
+/** 复合命令能否安全改写为 `vig --shell -- <整条命令>`。
+ *  实测管道/重定向/&& 的语义经 vig 透传不变；真正危险的是三类：
+ *  - stdin 重定向与 heredoc（< << <<<）：vigile 的子进程拿不到宿主 stdin，
+ *    会挂起或读到空
+ *  - 流式命令（-f/--follow/tail -f）：vigile 缓冲到命令结束才转发，
+ *    跟随型命令永不结束 → 死锁
+ *  - $() 反引号替换：外层行为不变但内层调用绕过审计，宁可放行不改写 */
+function shellSafe(cmd) {
+  if (/[<{2,}|<{1}[^<]/.test(cmd) && /[^-]\s*<|<<|<</.test(cmd)) return false;   // stdin 重定向/heredoc
+  if (/\$\(|`/.test(cmd)) return false;                        // 命令替换
+  if (/(^|[\s=])(-[a-zA-Z]*f|--follow)(\s|$|=)/.test(cmd)) return false;  // 流式
+  if (/\btail\s+(-[a-zA-Z]*f|--follow)/.test(cmd)) return false;
+  return true;
+}
+
 function isNoise(cmd) {
   const noise = loadRulesJson().noise;
   if (!Array.isArray(noise)) return DEFAULT_NOISE.has(baseName(firstToken(cmd) || ""));
@@ -271,12 +286,26 @@ function decide(raw) {
     }
   }
 
-  // 复合命令（含 | & > < ; && ||）不能改写成 `vig <整条命令>` —— 那会让管道
-  // 作用在 vigile 上，破坏原语义。但"不改写"绝不等于"不记录"：
-  // 曾经这里直接 return，导致 `shandian ... 2>&1 | tr -d '\r'` 这类带管道的
-  // 内部调用完全不留审计痕迹（真实漏审事故）。现在改为逐段记录后放行。
+  // 复合命令（含 | & > < ; && ||）的完整审计：
+  // 实测验证 `vig <原命令> | tail` 的管道语义不变（vig 透传 stdout/stderr），
+  // 所以能安全改写为 `vig --shell -- <整条命令>` —— 拿到真实 exit_code/耗时/输出。
+  // 三个例外保持旁路记录（改写会改变行为或死锁）：
+  //   1. stdin 重定向/heredoc（<、<<）—— vigile 的子进程读不到宿主 stdin
+  //   2. 流式命令（-f / --follow / tail -f）—— vigile 等命令结束才转发，永不结束
+  //   3. $() 命令替换 —— 里面的调用绕过审计，但外层行为不变，不值得冒险
   if (isComplex) {
-    recordComplex(cmd, hostMode);
+    if (canRewrite && shellSafe(cmd)) {
+      process.stdout.write(JSON.stringify({
+        hookSpecificOutput: {
+          hookEventName: "PreToolUse",
+          permissionDecision: "allow",
+          permissionDecisionReason: "vigile auto-wrap (shell)",
+          updatedInput: { ...input, command: `env -u VIGILE_CONFIRM -u GATE_CONFIRM -u AUDIT_CONFIRM ${prefix} --shell -- ${cmd}` },
+        },
+      }));
+    } else {
+      recordComplex(cmd, hostMode);
+    }
     return process.exit(0);
   }
 
