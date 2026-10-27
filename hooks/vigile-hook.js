@@ -103,7 +103,9 @@ function isNoise(cmd) {
   return noise.map(s => String(s).toLowerCase()).includes(baseName(firstToken(cmd) || ""));
 }
 const DEFAULT_NOISE = new Set(["ls", "pwd", "cat", "head", "tail", "grep", "find",
-  "which", "where", "whoami", "date", "echo", "wc", "stat", "file", "du", "df"]);
+  "which", "where", "whoami", "date", "echo", "wc", "stat", "file", "du", "df",
+  // 管道里的文本处理段：`... | tr -d '\r'` 这类只是格式化输出，不是调用本身
+  "tr", "sed", "awk", "cut", "sort", "uniq", "xargs", "tee", "jq", "column", "iconv"]);
 
 function firstToken(cmd) {
   const trimmed = cmd.trim();
@@ -242,7 +244,8 @@ function decide(raw) {
     const culprit = culpritOf(cmd, verdict);
     recordIntent(cmd, "denied",
       `[策略拒绝/${verdict.ruleId}] ${verdict.message}`, hostMode,
-      { tool: culprit.tool, action: culprit.action, target: culprit.target });
+      { tool: culprit.tool, action: culprit.action, target: culprit.target,
+        fullCommand: cmd, attributed: true });
     deny(`[vigile 策略拒绝] ${verdict.message}${verdict.hint ? " 建议：" + verdict.hint : ""}`);
   }
 
@@ -268,8 +271,14 @@ function decide(raw) {
     }
   }
 
-  // 复合命令无法安全改写或精确判定，但其首段仍要过 deny 检查（已在上面完成）。
-  if (isComplex) return process.exit(0);
+  // 复合命令（含 | & > < ; && ||）不能改写成 `vig <整条命令>` —— 那会让管道
+  // 作用在 vigile 上，破坏原语义。但"不改写"绝不等于"不记录"：
+  // 曾经这里直接 return，导致 `shandian ... 2>&1 | tr -d '\r'` 这类带管道的
+  // 内部调用完全不留审计痕迹（真实漏审事故）。现在改为逐段记录后放行。
+  if (isComplex) {
+    recordComplex(cmd, hostMode);
+    return process.exit(0);
+  }
 
   // 全量审计：白名单只决定"是否改写拿到完整结果"；记录面默认覆盖一切命令
   // （rules.json 的 audit_mode=all）。噪声名单（ls/cat/pwd 等高频只读）可关。
@@ -354,6 +363,75 @@ function culpritOf(cmd, verdict) {
   };
 }
 
+/** 复合命令的审计：不改写（保持管道/重定向语义），但逐段记录内部工具调用。
+ *  `shandian lane service-detail ... 2>&1 | tr -d '\r'` 必须留下 shandian 的痕迹，
+ *  否则带管道的调用整类是审计盲区。只记"值得记"的段：
+ *    内部工具（白名单）→ 必记
+ *    audit_mode=all 时的其他命令 → 记（噪声名单除外）
+ *  纯文本处理段（tr/grep/head/sort/awk 等）→ 当噪声跳过
+ *  meta 里保留整条命令，便于还原上下文。 */
+function recordComplex(cmd, host) {
+  const segs = splitSegments(cmd);
+  const full = cmd.slice(0, 1000);
+  const rows = [];
+  for (const text of segs) {
+    const trimmed = text.trim();
+    if (!trimmed) continue;
+    const tok = firstToken(trimmed);
+    if (!tok) continue;
+    const base = baseName(tok);
+    // 跳过段内的纯 shell 关键字与非命令段
+    if (["for", "do", "done", "if", "then", "else", "fi", "while", "export", "set"].includes(base)) continue;
+
+    const gated = needsGate(trimmed);
+    if (!gated && (auditMode() !== "all" || isNoise(trimmed))) continue;
+
+    const toks = trimmed.split(/\s+/).map(t => t.replace(/^["']|["']$/g, ""));
+    rows.push({
+      source: "hook", status: "ok", duration: 0,
+      tool: base,
+      action: toks[1] || "",
+      target: (toks.slice(2).find(t => t && !t.startsWith("-")) || "").slice(0, 200),
+      category: inferCategory(base, trimmed),
+      risk: inferRisk(base, trimmed),
+      args: JSON.stringify({ argv: toks, mode: MODE }),
+      meta: JSON.stringify({ source: "hook-bypass", host: host || MODE,
+        segment: trimmed.slice(0, 500), full_command: full }),
+    });
+    if (rows.length >= 20) break;   // 防御：超长命令不无限记
+  }
+  // 一条都没匹配上但整条命令里含内部工具（例如工具在管道后被 shell 包裹）→ 记整条
+  if (!rows.length && needsGate(cmd)) {
+    rows.push({
+      source: "hook", status: "ok", duration: 0,
+      tool: baseName(firstToken(cmd) || "unknown"),
+      action: "", category: inferCategory(firstToken(cmd) || "", cmd),
+      risk: inferRisk(firstToken(cmd) || "", cmd),
+      args: JSON.stringify({ argv: cmd.trim().split(/\s+/), mode: MODE }),
+      meta: JSON.stringify({ source: "hook-bypass", host: host || MODE, full_command: full }),
+    });
+  }
+  if (!rows.length) return;
+  // 批量写入：一次进程落 N 条（逐条 spawn 在长管道上会撞 4s 守护超时）
+  try {
+    spawnSync(process.execPath, [VIGILE_SCRIPT, "call-batch",
+      "--records", JSON.stringify(rows)], { timeout: 3000, stdio: "ignore" });
+  } catch { /* 审计失败绝不影响主流程 */ }
+}
+
+/** 按 shell 分隔符切段：&& || ; | 换行。重定向（2>&1、>）留在段内不切。 */
+function splitSegments(cmd) {
+  const segs = [];
+  let start = 0;
+  for (let i = 0; i < cmd.length; i++) {
+    const two = cmd.slice(i, i + 2);
+    if (two === "&&" || two === "||") { segs.push(cmd.slice(start, i)); i++; start = i + 1; }
+    else if (cmd[i] === ";" || cmd[i] === "|" || cmd[i] === "\n") { segs.push(cmd.slice(start, i)); start = i + 1; }
+  }
+  segs.push(cmd.slice(start));
+  return segs;
+}
+
 /** 旁路记录：宿主不支持命令改写时，由 hook 直接写入审计库。
  *  override 允许把记录归属到具体违规段（见 culpritOf）。 */
 function recordIntent(cmd, status, error, host, override) {
@@ -372,8 +450,14 @@ function recordIntent(cmd, status, error, host, override) {
       "--args", JSON.stringify({ argv: parts, mode: MODE }),
       "--meta", JSON.stringify({
         source: "hook-bypass", host: host || MODE,
-        // 复合命令被拒时，让后来人知道整条命令长什么样、违规的是哪一段
-        ...((override && override.tool) ? { full_command: cmd.slice(0, 500), attributed_to: override.tool } : {}),
+        // 逐段记录时把整条命令带上，便于还原上下文；
+        // 归因场景（culpritOf）额外标出真正违规的是哪一段。
+        ...((override && (override.fullCommand || override.tool))
+          ? {
+              full_command: (override.fullCommand || cmd).slice(0, 1000),
+              ...(override.attributed ? { attributed_to: override.tool } : {}),
+            }
+          : {}),
       }),
       ...(error ? ["--error", error] : []),
     ], { timeout: 5000, stdio: "ignore" });

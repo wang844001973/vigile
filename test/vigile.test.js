@@ -349,6 +349,17 @@ test("hook: 噪声名单命令被跳过（ls）", () => {
 });
 // 噪声与全量的区别在落库，不在 hook 输出——由 DB 集成测试与 rules.json 配置覆盖。
 
+// 复合命令不能改写（会破坏管道语义），但绝不等于不记录。
+// 真实事故：`shandian lane service-detail ... 2>&1 | tr -d '\r'` 因含管道
+// 被 isComplex 早退，整类调用成为审计盲区。
+test("hook: 带管道的内部调用仍记录（不改写但留痕）", () => {
+  const r = runHook("shandian lane service-detail --name voc-admin 2>&1 | tr -d x");
+  assert.equal(r.out.trim(), "");   // 不改写
+});
+test("hook: 复合命令含 && 也留痕", () => {
+  const r = runHook("cd /tmp && kubectl get pods");
+  assert.equal(r.out.trim(), "");
+});
 // ================================================================ vig 代理形态
 // vig shandian status == vigile run --quiet -- shandian status（rtk 式用法）。
 // 危险模式拆开构造，避免本测试源码里的字面量被真实 hook 拦截。

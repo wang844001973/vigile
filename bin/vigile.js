@@ -380,6 +380,33 @@ function cmdCall(args) {
   return EXIT_OK;
 }
 
+// 批量记录：复合命令一次 hook 调用可能产生多条记录。
+// hook 有 4s 守护超时，逐条 spawn node（~100ms/次）在长管道上会超时，
+// 因此改为一次进程写入全部记录，单条仍走 call。
+function cmdCallBatch(args) {
+  let rows;
+  try { rows = JSON.parse(args.records || "[]"); } catch {
+    err("--records 需要是 JSON 数组"); return EXIT_USAGE;
+  }
+  if (!Array.isArray(rows)) { err("--records 需要是 JSON 数组"); return EXIT_USAGE; }
+  const ids = [];
+  for (const r of rows) {
+    ids.push(record({
+      source: r.source || "hook", category: r.category, tool: r.tool,
+      action: r.action, target: r.target,
+      argsJson: r.args ? redact(String(r.args)) : null,
+      status: r.status || "ok", exitCode: r.exitCode, durationMs: r.duration ?? 0,
+      rows: r.rows, resultSize: r.resultSize,
+      outputDigest: r.output ? redact(String(r.output)).slice(0, 2000) : null,
+      error: r.error ? redact(String(r.error)) : null, risk: r.risk,
+      caseName: r.case, ticket: r.ticket,
+      metaJson: r.meta ? redact(String(r.meta)) : null,
+    }));
+  }
+  jsonOut({ ids, db: dbPath() });
+  return EXIT_OK;
+}
+
 function cmdCallFileChange(args) {
   const id = recordFileChange({ filePath: args.file, op: args.op,
     before: args.before || null, after: args.after || null,
@@ -458,6 +485,8 @@ function parseArgs(argv) {
     "--before": "before", "--after": "after", "--keep": "keep", "--format": "format",
     "--out": "out", "--interval": "interval", "--lines": "lines", "--agent": "agent",
     "--test": "test", "--filename": "filename", "--source": "source", "--port": "port",
+    "--records": "records",
+    "--rows": "rows",
   };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
@@ -506,7 +535,7 @@ const HELP = `vigile — 守夜人：AI agent 内部调用的统一入口（审�
 // 保留子命令：命中则走功能分支；不命中则视为代理命令（vig shandian status）。
 // 这是 rtk 式用法：不带 run --，第一个词就是真实命令。
 const RESERVED = new Set([
-  "run", "call", "call-file-change", "logs", "tail", "get", "stats", "slow",
+  "run", "call", "call-batch", "call-file-change", "logs", "tail", "get", "stats", "slow",
   "errors", "by-case", "timeline", "session", "diff", "export", "verify",
   "policy", "rules", "setup", "init", "prune",
   "-h", "--help", "help", "--version", "-V", "--", "-y", "--yes", "--quiet", "--json",
@@ -550,6 +579,7 @@ async function main() {
       case "policy": return cmdPolicy(args);
       case "rules": return cmdRules(args);
       case "call": return cmdCall(args);
+      case "call-batch": return cmdCallBatch(args);
       case "call-file-change": return cmdCallFileChange(args);
       case "prune": return cmdPrune(args);
       case "tail": return cmdTail(args);
