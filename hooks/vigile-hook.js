@@ -21,8 +21,15 @@ const VIGILE_SCRIPT = process.env.VIGILE_SCRIPT
   || path.join(path.dirname(HERE), "bin", "vigile.js");
 
 const IS_POST = process.argv.includes("--post");
+// 宿主能力模式（决定 hook 能做什么，见 decide() 里的三档降级）：
+//   claude  —— 支持 updatedInput，可改写命令 → 完整审计
+//   dsh     —— 桥不支持 updatedInput/additionalContext → 仅旁路记录意图 + deny
+//   zcode   —— 支持 additionalContext 提醒 → 提醒 + 旁路记录
+// 默认按环境推断；dsh 时通常会带 MULTICA_* 或 dsh 相关变量。
 const MODE = process.env.VIGILE_HOOK_MODE
-  || (process.env.CLAUDE_PROJECT_DIR && !process.env.ZCODE_PROJECT_DIR ? "claude" : "zcode");
+  || (process.env.CLAUDE_PROJECT_DIR && !process.env.ZCODE_PROJECT_DIR ? "claude"
+    : process.env.DSH_PROFILE || process.env.DSH_HOME ? "dsh"
+    : "zcode");
 
 // ---------------------------------------------------------------- 需审计的工具
 const AUDIT_TOOLS = new Set([
@@ -147,15 +154,28 @@ function decide(raw) {
   if (COMPLEX.test(cmd)) return process.exit(0);
   if (!needsGate(cmd)) return process.exit(0);
 
+  // 运行时判别宿主能力：dsh 的桥 payload 里 transcript_path 恒为空串
+  // （Claude Code 会给真实路径）。同一份 settings.json 被两边共用，
+  // 无法靠静态 VIGILE_HOOK_MODE 区分，必须在收到 payload 后判定。
+  const hostMode = detectHostMode(payload);
+
   // 策略审核：直接调用共享引擎（进程内，~1ms）
   const parts = cmd.trim().split(/\s+/);
   const verdict = evaluate(parts[0] || "", parts, cmd);
   if (verdict.decision === "deny") {
+    // 被拒也要留痕：命令不会执行，但"有人试图执行"是重要审计事实
+    recordIntent(cmd, "denied", `[策略拒绝/${verdict.ruleId}] ${verdict.message}`, hostMode);
     deny(`[vigile 策略拒绝] ${verdict.message}${verdict.hint ? " 建议：" + verdict.hint : ""}`);
   }
 
   const rewritten = `vigile run --quiet -- ${cmd}`;
-  if (MODE === "claude") {
+
+  // 三种宿主能力，逐级降级：
+  //   claude        —— 支持 updatedInput，改写为 vigile run 后由主程序完整审计（含结果/耗时）
+  //   dsh           —— 桥不支持 updatedInput（官方 README 明确：logged + warned but not honored），
+  //                    也忽略 additionalContext；只能由 hook 自己旁路记录"意图"。
+  //   zcode / other —— 支持 additionalContext 提醒，同时旁路记录。
+  if (hostMode === "claude") {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -164,7 +184,13 @@ function decide(raw) {
         updatedInput: { ...input, command: rewritten },
       },
     }));
+  } else if (hostMode === "dsh") {
+    // 旁路记录：命令照原样执行，但审计库留下这次调用的意图。
+    // 注意：dsh 桥无法回传执行结果，故 status 记 "ok"、duration 记 0，并在
+    // meta 标注 source=hook-bypass 以示与完整审计的区别。
+    recordIntent(cmd, "ok", null, hostMode);
   } else {
+    recordIntent(cmd, "ok", null, hostMode);
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -174,4 +200,35 @@ function decide(raw) {
     }));
   }
   process.exit(0);
+}
+
+/** 运行时判别宿主能力。
+ *  dsh 桥的 payload 特性（官方 README）：transcript_path 恒为空串、
+ *  且不带 permission_mode / prompt_id。Claude Code 会给真实路径。
+ *  返回 "claude"（可改写）或 "dsh"（只能旁路记录）。 */
+function detectHostMode(payload) {
+  if (process.env.VIGILE_HOOK_MODE === "dsh") return "dsh";
+  if (process.env.VIGILE_HOOK_MODE === "zcode") return "zcode";
+  // 显式指定 claude 也要复核：dsh 复用同一份 settings.json
+  if (payload && payload.transcript_path === "") return "dsh";
+  if (MODE === "claude") return "claude";
+  return MODE;
+}
+
+/** 旁路记录：宿主不支持命令改写时，由 hook 直接写入审计库。 */
+function recordIntent(cmd, status, error, host) {
+  try {
+    const parts = cmd.trim().split(/\s+/);
+    spawnSync(process.execPath, [VIGILE_SCRIPT, "call",
+      "--tool", baseName(parts[0] || "unknown"),
+      "--action", parts[1] || "",
+      "--category", "other",
+      "--status", status,
+      "--duration", "0",
+      "--risk", "unknown",
+      "--args", JSON.stringify({ argv: parts, mode: MODE }),
+      "--meta", JSON.stringify({ source: "hook-bypass", host: host || MODE }),
+      ...(error ? ["--error", error] : []),
+    ], { timeout: 5000, stdio: "ignore" });
+  } catch { /* 审计失败绝不影响主流程 */ }
 }
