@@ -1,236 +1,177 @@
 #!/usr/bin/env node
-// ZCode PreToolUse hook: 自动把内部系统命令包装成 audit run，实现全量审计。
+// vigile PreToolUse / PostToolUse hook
 //
-// 原理（参考 rtk hook 的 updatedInput 改写机制）：
-//   拦截 Bash 调用 → 分析命令 → 若是需要审计的内部调用且尚未包装
-//   → 返回 updatedInput 把命令改写成 `vigile run --quiet -- <原命令>`
-//   → ZCode 执行改写后的命令，审计自动落库
+// 切 Node 的核心收益：hook 直接 import 策略引擎与规则表 ——
+// 与主程序共用同一份实现，不会再出现"主程序认识某工具而 hook 不认识"的逻辑漂移，
+// 且策略判定从"spawn 子进程 250ms"降为进程内函数调用（~1ms）。
 //
-// 设计约束：
-//   1. 失败即放行（fail-open）：任何解析/异常都不阻断原命令，审计不能影响排查。
-//   2. 幂等：已经带 audit run 的命令不重复包装。
-//   3. 只包装单条命令；含管道/重定向/分号/逻辑符的复合命令不改写，
-//      避免语义变化（宁可漏审计，不可改行为）。
-//   4. 只包装「访问本机以外内部系统」的命令，本地只读操作不动。
+// 用法:
+//   node vigile-hook.js            # PreToolUse（Bash 拦截/改写）
+//   node vigile-hook.js --post     # PostToolUse（Edit/Write 文件变更 diff）
+//   VIGILE_HOOK_MODE=claude        # Claude 系（支持 updatedInput 改写）；默认 zcode（仅提醒+deny）
 
-const { execFileSync } = require('child_process');
+import fs from "node:fs";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { evaluate } from "../src/engine.js";
 
-const HOOK_TIMEOUT = setTimeout(() => process.exit(0), 3000);
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const VIGILE_SCRIPT = process.env.VIGILE_SCRIPT
+  || path.join(path.dirname(HERE), "bin", "vigile.js");
 
-// 平台模式：claude（支持命令改写）| zcode/其他（只提醒）
-// 可用 VIGILE_HOOK_MODE 覆盖；默认按 hook 来源判断
-function detectMode() {
-  if (process.env.VIGILE_HOOK_MODE) return process.env.VIGILE_HOOK_MODE;
-  if (process.env.CLAUDE_PROJECT_DIR && !process.env.ZCODE_PROJECT_DIR) return 'claude';
-  return 'zcode';
-}
-const MODE = detectMode();
+const IS_POST = process.argv.includes("--post");
+const MODE = process.env.VIGILE_HOOK_MODE
+  || (process.env.CLAUDE_PROJECT_DIR && !process.env.ZCODE_PROJECT_DIR ? "claude" : "zcode");
 
-// vigile 脚本路径：优先环境变量；否则从 hook 自身位置向上推导
-// （hooks/vigile-hook.js → 上两级 = 仓库根 → scripts/vigile.py），
-// 与 clone 到哪里无关，Windows/WSL/macOS 通用。
-const VIGILE_SCRIPT = process.env.VIGILE_SCRIPT || (() => {
-  const here = __dirname.replace(/\\/g, '/');
-  return require('path').join(here, '..', 'scripts', 'vigile.py');
-})();
-// 解释器：Windows 上 python3 常是 WindowsApps 空壳，故默认 python；
-// Linux/macOS 惯例是 python3。可用 VIGILE_PYTHON 覆盖。
-const PYTHON = process.env.VIGILE_PYTHON
-  || (process.platform === 'win32' ? 'python' : 'python3');
-
-// ---- 需要审计的命令（工具名 → 是否需要包装） ----
-// 匹配命令的第一个 token（允许带路径与 .exe）
-const VIGILE_TOOLS = new Set([
-  // 日志
-  'log-query', 'online-log-query',
-  // 数据库
-  'bigdata-query', 'dbq', 'redash', 'psql', 'mysql', 'clickhouse-client',
-  // Mongo / 数据平台
-  'shandian', 'mongosh', 'mongo', 'mongoexport',
-  // 工单
-  'jira', 'jira-transition', 'jira_transition',
-  // 内部业务 CLI
-  'goods-center', 'order-center', 'knowledge-base', 'workflow-debug',
-  'agentos', 'client-log-fetch', 'grafana-cli',
-  // 运维
-  'kubectl', 'helm',
+// ---------------------------------------------------------------- 需审计的工具
+const AUDIT_TOOLS = new Set([
+  "log-query", "online-log-query",
+  "bigdata-query", "dbq", "redash", "psql", "mysql", "clickhouse-client",
+  "shandian", "mongosh", "mongo", "mongoexport",
+  "jira", "jira-transition", "jira_transition",
+  "goods-center", "order-center", "knowledge-base", "workflow-debug",
+  "agentos", "client-log-fetch", "grafana-cli",
+  "kubectl", "helm",
 ]);
-
-// Python 脚本形式的内部工具（判断脚本名）
-const VIGILE_SCRIPTS = /(?:^|[/\\])(ticket_intake|jira|jira_transition|dialog_query|order_center|prometheus|redash|glab|agentos_execution|kb_\w+|badcase_ticket|ticket_intake)\.py$/i;
-
-// 复合命令特征：出现则不改写（保持原语义）
+const AUDIT_SCRIPTS = /(?:^|[/\\])(ticket_intake|jira|jira_transition|dialog_query|order_center|prometheus|redash|glab|agentos_execution|kb_\w+|badcase_ticket)\.py$/i;
 const COMPLEX = /[|;&><`]|\$\(|\|\||&&/;
-
-let buf = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', d => { buf += d; });
-process.stdin.on('end', () => { clearTimeout(HOOK_TIMEOUT); decide(buf); });
-process.stdin.on('error', () => { clearTimeout(HOOK_TIMEOUT); process.exit(0); });
 
 function firstToken(cmd) {
   const trimmed = cmd.trim();
-  if (!trimmed) return '';
-  // 去掉前缀环境变量赋值，如 FOO=1 mycmd
+  if (!trimmed) return "";
   const parts = trimmed.split(/\s+/);
   let i = 0;
   while (i < parts.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(parts[i])) i++;
-  return parts[i] || '';
+  return parts[i] || "";
 }
 
 function baseName(token) {
-  return token.replace(/^["']|["']$/g, '').split(/[/\\]/).pop().toLowerCase().replace(/\.exe$/, '');
+  return token.replace(/^["']|["']$/g, "").split(/[/\\]/).pop().toLowerCase().replace(/\.exe$/, "");
 }
 
 function needsGate(cmd) {
   const tok = firstToken(cmd);
   if (!tok) return false;
   const base = baseName(tok);
-
-  // 已包装过 → 幂等跳过
-  if (base === 'gate') return false;
-  // rtk 代理：命令在 rtk 之后，检查它代理的真实工具
-  if (base === 'rtk') {
+  if (base === "vigile" || base === "vig") return false;   // 已过闸
+  if (base === "rtk") {
     const after = cmd.trim().split(/\s+/).slice(1);
-    if (!after.length) return false;
-    return VIGILE_TOOLS.has(baseName(after[0]));
+    return after.length ? AUDIT_TOOLS.has(baseName(after[0])) : false;
   }
-  if (VIGILE_TOOLS.has(base)) return true;
-  // python xxx.py 形式
-  if (base === 'python' || base === 'python3') {
+  if (AUDIT_TOOLS.has(base)) return true;
+  if (base === "python" || base === "python3") {
     const m = cmd.match(/python3?\s+(?:"[^"]+"|'[^']+'|\S+)/);
-    if (m && VIGILE_SCRIPTS.test(m[0])) return true;
+    if (m && AUDIT_SCRIPTS.test(m[0])) return true;
   }
   return false;
 }
 
-// 调 audit.py policy --test 做判定；调用失败按 allow 处理（fail-open），
-// 但 audit run 自己还会再拦一道（双保险）。
-function policyCheck(cmd) {
-  try {
-    const out = execFileSync(PYTHON, [
-      VIGILE_SCRIPT, 'policy', '--test', cmd,
-    ], {
-      encoding: 'utf8', timeout: 2500,
-      env: { ...process.env },
-      input: '',
-    });
-    return JSON.parse(out);
-  } catch (e) {
-    const out = (e.stdout || '').toString();
-    if (out.trim().startsWith('{')) {
-      try { return JSON.parse(out); } catch (_) {}
-    }
-    return { decision: 'allow', reason: '策略引擎不可用', rule: 'fail-open' };
-  }
-}
-
 function deny(reason) {
-  // deny 对两个平台都是标准能力（ZCode 文档明确支持 deny；Claude 同样）
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
-      hookEventName: 'PreToolUse',
-      permissionDecision: 'deny',
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
       permissionDecisionReason: reason,
     },
   }));
   process.exit(0);
 }
 
-const IS_POST = process.argv.includes('--post');
+// ---------------------------------------------------------------- PostToolUse：文件变更 diff
+function diffLines(before, after) {
+  const a = String(before || "").split("\n");
+  const b = String(after || "").split("\n");
+  if (a.length * b.length > 4000000) {
+    return { text: "（文件较大，diff 省略）", added: b.length, removed: a.length };
+  }
+  const n = a.length, m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out = [];
+  let added = 0, removed = 0, i = 0, j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) { out.push(" " + b[j]); i++; j++; }
+    else if (dp[i + 1][j] >= dp[i][j + 1]) { out.push("-" + a[i]); removed++; i++; }
+    else { out.push("+" + b[j]); added++; j++; }
+  }
+  while (i < n) { out.push("-" + a[i++]); removed++; }
+  while (j < m) { out.push("+" + b[j++]); added++; }
+  return { text: out.slice(0, 200).join("\n").slice(0, 4000), added, removed };
+}
+
+function handlePostToolUse(payload) {
+  const ti = payload.tool_input || {};
+  const filePath = ti.file_path || ti.notebook_path;
+  if (!filePath) return;
+  let after = null;
+  try { after = fs.readFileSync(filePath, "utf8"); } catch { return; }
+
+  let before = null;
+  if (payload.tool_name === "Edit" && ti.new_string && after.includes(ti.new_string)) {
+    before = after.replace(ti.new_string, ti.old_string || "");
+  }
+  spawnSync(process.execPath, [VIGILE_SCRIPT, "call-file-change",
+    "--file", filePath,
+    "--op", payload.tool_name === "Write" ? "write" : "edit",
+    "--before", before || "",
+    "--after", after], { timeout: 4000, stdio: "ignore" });
+}
+
+// ---------------------------------------------------------------- 主流程
+let buf = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", d => { buf += d; });
+process.stdin.on("end", () => decide(buf));
+process.stdin.on("error", () => process.exit(0));
+const guard = setTimeout(() => process.exit(0), 4000);
 
 function decide(raw) {
+  clearTimeout(guard);
   let payload = {};
   try { payload = JSON.parse(raw); } catch { return process.exit(0); }
 
-  // --post 模式或 PostToolUse 事件：记录文件变更差异（只读旁路，绝不阻塞）
-  if (IS_POST || payload.hook_event_name === 'PostToolUse'
-      || payload.event === 'PostToolUse') {
-    try { handlePostToolUse(payload); } catch (e) { /* 永不影响主流程 */ }
-    process.exit(0);
+  if (IS_POST || payload.hook_event_name === "PostToolUse" || payload.event === "PostToolUse") {
+    try { handlePostToolUse(payload); } catch { /* 永不影响主流程 */ }
+    return process.exit(0);
   }
 
-  if ((payload.tool_name || '') !== 'Bash') return process.exit(0);
-
+  if ((payload.tool_name || "") !== "Bash") return process.exit(0);
   const input = payload.tool_input || {};
-  const cmd = input.command || '';
+  const cmd = input.command || "";
   if (!cmd) return process.exit(0);
-
-  // 复合命令不改写，避免改变语义
   if (COMPLEX.test(cmd)) return process.exit(0);
-
   if (!needsGate(cmd)) return process.exit(0);
 
-  // ---- 策略审核（与 audit.py 同一套规则） ----
-  // 让 audit.py 判定，hook 只负责按平台表达结果。
-  const verdict = policyCheck(cmd);
-  if (verdict.decision === 'deny') {
-    deny(`[audit 策略拒绝] ${verdict.reason}。命令未执行；调整 ~/.audit/policy.json 可修改规则。`);
+  // 策略审核：直接调用共享引擎（进程内，~1ms）
+  const parts = cmd.trim().split(/\s+/);
+  const verdict = evaluate(parts[0] || "", parts, cmd);
+  if (verdict.decision === "deny") {
+    deny(`[vigile 策略拒绝] ${verdict.message}${verdict.hint ? " 建议：" + verdict.hint : ""}`);
   }
 
   const rewritten = `vigile run --quiet -- ${cmd}`;
-
-  // 平台能力差异（实测）：
-  //   Claude 支持 updatedInput，可真正改写命令 → 强制审计
-  //   ZCode 不支持 updatedInput（文档仅允许 additionalContext + permissionDecision），
-  //         只能注入提醒，靠 agent 自觉遵守
-  if (MODE === 'claude') {
+  if (MODE === "claude") {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'allow',
-        permissionDecisionReason: 'vigile auto-wrap',
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+        permissionDecisionReason: "vigile auto-wrap",
         updatedInput: { ...input, command: rewritten },
       },
     }));
   } else {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'allow',
-        additionalContext:
-          `[gate] 该命令访问内部系统但未包装。请改用：${rewritten}`,
+        hookEventName: "PreToolUse",
+        permissionDecision: "allow",
+        additionalContext: `[vigile] 该命令访问内部系统但未包装。请改用：${rewritten}`,
       },
     }));
   }
   process.exit(0);
-}
-
-// ================= PostToolUse：文件变更差异记录 =================
-// agent 用 Edit/Write 改完文件后，把改前/改后内容交给 gate 记 diff。
-// 协议（各 agent 一致）：stdin 收 { tool_name, tool_input, tool_response }
-// Edit 的 tool_input: { file_path, old_string, new_string }
-// Write 的 tool_input: { file_path, content }
-function handlePostToolUse(p) {
-  const ti = p.tool_input || {};
-  const path = ti.file_path || ti.notebook_path;
-  if (!path) return;
-
-  if (p.tool_name === 'Edit') {
-    // 改前 = 文件当前内容 - old_string + new_string 已应用后
-    // PostToolUse 时文件已是改后状态；改前可由 new_string 反推：
-    // before = after.replace(new_string, old_string)（单次出现时精确）
-    try {
-      const fs = require('fs');
-      let after = null;
-      try { after = fs.readFileSync(path, 'utf8'); } catch (e) { /* 文件可能被移走 */ }
-      let before = null;
-      if (after !== null && ti.new_string && after.includes(ti.new_string)) {
-        before = after.replace(ti.new_string, ti.old_string || '');
-      }
-      execFileSync(PYTHON, [VIGILE_SCRIPT, 'call-file-change',
-        '--file', path, '--op', 'edit',
-        '--before', before || '', '--after', after || ''], { timeout: 3000 });
-    } catch (e) { /* 差异记录失败不影响主流程 */ }
-  } else if (p.tool_name === 'Write') {
-    try {
-      const fs = require('fs');
-      let after = null;
-      try { after = fs.readFileSync(path, 'utf8'); } catch (e) {}
-      // Write 是整文件覆盖；before 无法从 input 推断，留空（新增文件场景）
-      execFileSync(PYTHON, [VIGILE_SCRIPT, 'call-file-change',
-        '--file', path, '--op', 'write',
-        '--before', '', '--after', after || ''], { timeout: 3000 });
-    } catch (e) {}
-  }
 }
