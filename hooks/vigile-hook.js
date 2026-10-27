@@ -21,15 +21,32 @@ const VIGILE_SCRIPT = process.env.VIGILE_SCRIPT
   || path.join(path.dirname(HERE), "bin", "vigile.js");
 
 const IS_POST = process.argv.includes("--post");
-// 宿主能力模式（决定 hook 能做什么，见 decide() 里的三档降级）：
-//   claude  —— 支持 updatedInput，可改写命令 → 完整审计
-//   dsh     —— 桥不支持 updatedInput/additionalContext → 仅旁路记录意图 + deny
-//   zcode   —— 支持 additionalContext 提醒 → 提醒 + 旁路记录
+// 宿主能力模式（决定 hook 能做什么，见 decide() 里的降级分支）：
+//   claude / zcode —— 支持 PreToolUse 的 updatedInput，可改写命令 → 完整审计
+//   dsh            —— 桥不支持 updatedInput/additionalContext → 仅旁路记录意图 + deny
 // 默认按环境推断；dsh 时通常会带 MULTICA_* 或 dsh 相关变量。
 const MODE = process.env.VIGILE_HOOK_MODE
   || (process.env.CLAUDE_PROJECT_DIR && !process.env.ZCODE_PROJECT_DIR ? "claude"
     : process.env.DSH_PROFILE || process.env.DSH_HOME ? "dsh"
     : "zcode");
+
+// 改写后的命令必须以一个可解析的命令开头，否则被拦截的命令会变成
+// "command not found" —— 那等于是 hook 把用户的正常命令弄坏了。
+// 优先用 `vigile`（命令列表可读）；PATH 上没有就退回 node + 绝对脚本路径，
+// 两者都拿不到时返回空串，由调用方降级为旁路记录。
+let VIGILE_PREFIX = null;
+function vigilePrefix() {
+  if (VIGILE_PREFIX !== null) return VIGILE_PREFIX;
+  const probe = process.platform === "win32" ? "where" : "which";
+  for (const name of ["vigile", "vig"]) {
+    const r = spawnSync(probe, [name], { encoding: "utf8", timeout: 2000, windowsHide: true });
+    if (r.status === 0 && (r.stdout || "").trim()) { VIGILE_PREFIX = name; return VIGILE_PREFIX; }
+  }
+  VIGILE_PREFIX = fs.existsSync(VIGILE_SCRIPT)
+    ? `"${process.execPath}" "${VIGILE_SCRIPT}"`
+    : "";
+  return VIGILE_PREFIX;
+}
 
 // ---------------------------------------------------------------- 需审计的工具
 const AUDIT_TOOLS = new Set([
@@ -85,6 +102,17 @@ function deny(reason) {
   process.exit(0);
 }
 
+function ask(reason) {
+  process.stdout.write(JSON.stringify({
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "ask",
+      permissionDecisionReason: reason,
+    },
+  }));
+  process.exit(0);
+}
+
 // ---------------------------------------------------------------- PostToolUse：文件变更 diff
 function diffLines(before, after) {
   const a = String(before || "").split("\n");
@@ -130,6 +158,7 @@ function handlePostToolUse(payload) {
 }
 
 // ---------------------------------------------------------------- 主流程
+try{fs.appendFileSync(require("node:path").join(process.env.TEMP||"/tmp","vigile-hook-trace.log"),new Date().toISOString())}catch{}
 let buf = "";
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", d => { buf += d; });
@@ -151,15 +180,14 @@ function decide(raw) {
   const input = payload.tool_input || {};
   const cmd = input.command || "";
   if (!cmd) return process.exit(0);
-  if (COMPLEX.test(cmd)) return process.exit(0);
-  if (!needsGate(cmd)) return process.exit(0);
 
   // 运行时判别宿主能力：dsh 的桥 payload 里 transcript_path 恒为空串
   // （Claude Code 会给真实路径）。同一份 settings.json 被两边共用，
   // 无法靠静态 VIGILE_HOOK_MODE 区分，必须在收到 payload 后判定。
   const hostMode = detectHostMode(payload);
 
-  // 策略审核：直接调用共享引擎（进程内，~1ms）
+  // 策略审核必须先于一切早退：拒绝判定与是否为"内部工具"无关。
+  // 早退放在前面会让 rm -rf /、DROP TABLE 这类系统级危险命令直通。
   const parts = cmd.trim().split(/\s+/);
   const verdict = evaluate(parts[0] || "", parts, cmd);
   if (verdict.decision === "deny") {
@@ -167,15 +195,31 @@ function decide(raw) {
     recordIntent(cmd, "denied", `[策略拒绝/${verdict.ruleId}] ${verdict.message}`, hostMode);
     deny(`[vigile 策略拒绝] ${verdict.message}${verdict.hint ? " 建议：" + verdict.hint : ""}`);
   }
+  // ask 档交给宿主弹确认：hook 自己无法交互，只能把判定转成宿主的"询问"。
+  // dsh 桥不支持 ask，降级为放行 —— 但审计库仍留下这次调用的意图。
+  if (verdict.decision === "ask") {
+    if (hostMode === "dsh") {
+      recordIntent(cmd, "ok", `[需确认/${verdict.ruleId}] ${verdict.message}`, hostMode);
+    } else {
+      ask(`[vigile 需确认] ${verdict.message}${verdict.hint ? " 建议：" + verdict.hint : ""}`);
+    }
+  }
 
-  const rewritten = `vigile run --quiet -- ${cmd}`;
+  // 复合命令无法安全改写或精确判定，但其首段仍要过 deny 检查（已在上面完成）。
+  if (COMPLEX.test(cmd)) return process.exit(0);
+  if (!needsGate(cmd)) return process.exit(0);
 
-  // 三种宿主能力，逐级降级：
-  //   claude        —— 支持 updatedInput，改写为 vigile run 后由主程序完整审计（含结果/耗时）
-  //   dsh           —— 桥不支持 updatedInput（官方 README 明确：logged + warned but not honored），
-  //                    也忽略 additionalContext；只能由 hook 自己旁路记录"意图"。
-  //   zcode / other —— 支持 additionalContext 提醒，同时旁路记录。
-  if (hostMode === "claude") {
+  const prefix = vigilePrefix();
+  const rewritten = `${prefix || "vigile"} run --quiet -- ${cmd}`;
+
+  // 两种宿主能力，逐级降级：
+  //   claude / zcode —— 支持 PreToolUse 的 updatedInput，改写为 vigile run 后
+  //                     由主程序完整审计（含真实 exit_code / 耗时 / 输出摘要）。
+  //   dsh            —— 桥不支持 updatedInput（官方 README 明确：logged + warned
+  //                     but not honored），也忽略 additionalContext；只能由 hook
+  //                     自己旁路记录"意图"，且拿不到执行结果。
+  // 拿不到可执行的 vigile 前缀时不改写，否则命令会变成 command not found。
+  if ((hostMode === "claude" || hostMode === "zcode") && prefix) {
     process.stdout.write(JSON.stringify({
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
@@ -184,20 +228,11 @@ function decide(raw) {
         updatedInput: { ...input, command: rewritten },
       },
     }));
-  } else if (hostMode === "dsh") {
-    // 旁路记录：命令照原样执行，但审计库留下这次调用的意图。
-    // 注意：dsh 桥无法回传执行结果，故 status 记 "ok"、duration 记 0，并在
-    // meta 标注 source=hook-bypass 以示与完整审计的区别。
-    recordIntent(cmd, "ok", null, hostMode);
   } else {
+    // 旁路记录：命令照原样执行，但审计库留下这次调用的意图。
+    // 拿不到结果，故 status 记 "ok"、duration 记 0，并标注 source=hook-bypass
+    // 以示与完整审计的区别（真实结果请看宿主自己的日志）。
     recordIntent(cmd, "ok", null, hostMode);
-    process.stdout.write(JSON.stringify({
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "allow",
-        additionalContext: `[vigile] 该命令访问内部系统但未包装。请改用：${rewritten}`,
-      },
-    }));
   }
   process.exit(0);
 }
@@ -220,6 +255,7 @@ function recordIntent(cmd, status, error, host) {
   try {
     const parts = cmd.trim().split(/\s+/);
     spawnSync(process.execPath, [VIGILE_SCRIPT, "call",
+      "--source", "hook",
       "--tool", baseName(parts[0] || "unknown"),
       "--action", parts[1] || "",
       "--category", "other",

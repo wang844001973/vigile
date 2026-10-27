@@ -351,7 +351,9 @@ function cmdRules(args) {
 }
 
 function cmdCall(args) {
-  const id = record({ source: "python", category: args.category, tool: args.tool,
+  // 默认 python：call 的主要调用方是各技能内的 Python 脚本。
+  // hook 旁路记录必须显式传 --source hook 才能与真实脚本调用区分。
+  const id = record({ source: args.source || "python", category: args.category, tool: args.tool,
     action: args.action, target: args.target,
     argsJson: args.args ? redact(args.args) : null,
     status: args.status, exitCode: args.exitCode, durationMs: args.duration,
@@ -422,7 +424,7 @@ function parseArgs(argv) {
     "--since": "since", "--keyword": "keyword", "--file": "file", "--op": "op",
     "--before": "before", "--after": "after", "--keep": "keep", "--format": "format",
     "--out": "out", "--interval": "interval", "--lines": "lines", "--agent": "agent",
-    "--test": "test", "--filename": "filename",
+    "--test": "test", "--filename": "filename", "--source": "source",
   };
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
